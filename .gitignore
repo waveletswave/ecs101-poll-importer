@@ -1,0 +1,26 @@
+# Google OAuth / local configuration
+credentials.json
+authorized_user.json
+config.json
+
+# Course data — may contain identifiable student records
+*.csv
+*.xlsx
+data/
+output_preview*/
+output_preview_v2/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# Logs / temporary files
+*.log
+*.tmp
