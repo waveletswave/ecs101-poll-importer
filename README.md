@@ -1,187 +1,72 @@
 # ECS101 Poll Everywhere Importer
 
-A small Python tool for turning Poll Everywhere CSV exports into an automatically maintained attendance and question-score tracker for Duke ECS101.
+A small Python tool for turning Poll Everywhere CSV exports into a shared Google Sheets tracker for **attendance, question scores, and the semester leaderboard**.
+
+**Current version: v2.1.1**
 
 ## Workflow
 
 ```text
-Poll Everywhere CSV exports
-            ↓
-      Python importer
-            ↓
-  cleaned canonical records
-            ↓
-Roster / Questions / Responses / Import Log
-            ↓
-    automatically rebuilt
-            ↓
-Attendance / Scores / Leaderboard
-            ↓
-     shared Google Sheet
+Canvas roster CSV ───────────────→ Roster
+                                     ↓
+Poll Everywhere CSVs → Participant matching → Responses
+                                     ↓
+                    Attendance / Attendance Review
+                         Scores / Leaderboard
+                                     ↓
+                           shared Google Sheet
 ```
 
-The original Poll Everywhere CSV files remain the raw source data. The Google Sheet stores cleaned response records and automatically generated course summaries.
+Canvas is the authoritative student roster. Poll Everywhere names are matched to Canvas students before they count toward attendance or scores.
 
-## What it does
+## Core rules
 
-For each class meeting:
-
-- **Attendance:** a student is marked present if they answered **any** imported Poll Everywhere question that day.
-- **Question scores:**
-  - `1` = answered correctly
-  - `0` = answered incorrectly
-  - blank = did not answer that question
-- Each Poll Everywhere CSV is treated as one question.
-- The TA selects the correct answer interactively because the current Poll Everywhere CSV exports do not identify the correct answer.
-- Enter `S` for a poll that should count toward attendance but should **not** be scored.
-- The script automatically rebuilds attendance, scores, and the semester leaderboard after each import.
-- Exact duplicate CSV files are detected using a **SHA-256 file hash**, even if the file has been renamed.
-- If a student submitted multiple responses to the same question, the latest response is used as the effective response.
+- A student is **present** if they answered at least one imported Poll Everywhere question that day.
+- For scored questions:
+  - `1` = correct
+  - `0` = incorrect
+  - blank = no response
+- Enter `S` for a poll that counts toward attendance but should not be scored.
+- If a student submits multiple responses to one question, the latest response is used.
+- Exact duplicate CSVs are detected by SHA-256 hash, even if renamed.
+- Fuzzy name matching only suggests candidates. It never confirms a student automatically.
+- Staff and guests can be saved as non-students.
+- Students missing from a later Canvas roster are marked inactive rather than deleted.
 
 ## Google Sheet structure
 
-The v2 importer separates canonical data from automatically generated views.
+### Canonical data
 
-### Canonical tables
+- **Roster** — authoritative Canvas roster
+- **Participant Map** — persistent Poll Everywhere name → Canvas student mappings
+- **Questions** — imported questions and correct answers
+- **Responses** — one effective response per identity per question
+- **Import Log** — imported-file history and duplicate protection
 
-These are the source of truth used by the program.
+### Rebuilt views
 
-#### `Roster`
+- **Attendance** — one student per row, one class date per column
+- **Attendance Review** — class summary, students with no matched Poll response, and unresolved identities
+- **Scores** — `1`, `0`, or blank for each scored question
+- **Leaderboard** — cumulative correct answers, questions answered, and accuracy
 
-One row per observed student.
-
-| Student Key | Student Name | Active | Notes |
-|---|---|---|---|
-
-Students are automatically added when they first appear in Poll Everywhere data.
-
-`Student Key` is currently generated from the registered participant name. The program does not attempt to guess whether differently spelled names belong to the same student.
-
-#### `Questions`
-
-One row per imported question.
-
-Includes:
-
-- Question ID
-- class date
-- question / source-file name
-- available answer choices
-- correct answer
-- whether the question is scored
-- source-file hash
-- import timestamp
-
-#### `Responses`
-
-One row represents one student's **effective response to one question**.
-
-Includes:
-
-- class date
-- Question ID
-- student key and name
-- Poll Everywhere screen name
-- response
-- correctness
-- timestamp
-- source file
-- file hash
-
-If a student submitted multiple responses to one question, only the latest response is stored here.
-
-The original Poll Everywhere CSV remains the raw archive.
-
-#### `Import Log`
-
-Records completed imports, including:
-
-- source file
-- SHA-256 file hash
-- Question ID
-- number of imported responses
-- import timestamp
-
-This prevents the same CSV from accidentally being imported twice.
-
-### Automatically generated views
-
-These tables can be completely rebuilt from the canonical data.
-
-#### `Attendance`
-
-One row per student and one column per class date.
-
-`P` means the student answered at least one Poll Everywhere question that day.
-
-#### `Scores`
-
-One row per student and one column per scored question.
-
-Values are:
-
-- `1` = correct
-- `0` = incorrect
-- blank = no response
-
-The final columns summarize total correct answers, number of questions answered, and accuracy.
-
-#### `Leaderboard`
-
-Semester ranking based primarily on total correct answers.
-
-It also reports questions answered and accuracy.
-
-## Files in this repository
-
-- `ecs101_poll_importer.py` — main program
-- `requirements.txt` — Python dependency
-- `config.example.json` — example local Google Sheet configuration
-- `.gitignore` — prevents credentials and student data from being committed
-
-Local OAuth credentials, real Poll Everywhere CSVs, and course records are **not** stored in GitHub.
+The original Poll Everywhere CSV files remain the raw archive.
 
 ## Installation
 
 Python 3.10+ is recommended.
 
-Install the dependency:
-
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-## Google Sheets setup
+Copy the example configuration:
 
-The importer uses Google's standard OAuth browser authentication through `gspread`.
-
-### One-time setup
-
-1. Create or choose the shared ECS101 Google Sheet.
-2. Enable the **Google Sheets API** in a Google Cloud project.
-3. Configure the Google Auth consent screen.
-4. Create a **Desktop app OAuth client**.
-5. Download the OAuth client JSON as:
-
-```text
-credentials.json
+```bash
+cp config.example.json config.json
 ```
 
-6. Copy:
-
-```text
-config.example.json
-```
-
-to:
-
-```text
-config.json
-```
-
-and enter the shared spreadsheet ID.
-
-Example:
+Add the shared Google Sheet ID to `config.json`:
 
 ```json
 {
@@ -191,28 +76,49 @@ Example:
 }
 ```
 
-7. Test the connection:
+The project uses a Google **Desktop OAuth client** with Google Sheets API access. Save its client file locally as `credentials.json`.
+
+Test the connection:
 
 ```bash
 python ecs101_poll_importer.py --check-google
 ```
 
-On the first run, a browser window opens for Google authorization.
+The first authorization creates a local `authorized_user.json`.
 
-The resulting local OAuth token is stored as:
+## 1. Import or update the Canvas roster
 
-```text
-authorized_user.json
+Download the Canvas gradebook/roster CSV and run:
+
+```bash
+python ecs101_poll_importer.py --import-roster CanvasGrades.csv
 ```
 
-Do **not** commit or share this file. Each TA should authorize their own Google account.
+Only roster-identifying fields are read. Assignment and grade columns are ignored.
 
-## Normal class workflow
+The importer:
 
-Put all Poll Everywhere CSV files from one class meeting into a folder:
+1. updates the authoritative roster;
+2. automatically accepts unique exact name matches;
+3. reuses previously confirmed mappings;
+4. asks for human review when a Poll Everywhere name is ambiguous.
+
+During review:
 
 ```text
-2026-08-26/
+1-5  choose a suggested Canvas student
+N    mark as non-student / staff / guest
+S    leave unresolved for now
+```
+
+Re-import an updated Canvas roster after add/drop. Students no longer listed are retained historically but marked inactive.
+
+## 2. Import Poll Everywhere results after class
+
+Put that day's Poll Everywhere CSVs in one folder:
+
+```text
+2026-08-27/
     question1.csv
     question2.csv
     question3.csv
@@ -221,127 +127,83 @@ Put all Poll Everywhere CSV files from one class meeting into a folder:
 Run:
 
 ```bash
-python ecs101_poll_importer.py 2026-08-26
+python ecs101_poll_importer.py 2026-08-27
 ```
 
-For each question, the importer displays the Poll Everywhere answer choices:
+For each question, select its correct answer:
 
 ```text
-Question 1 of 3
-File: question1.csv
-
-  1. Answer A
-  2. Answer B
-  3. Answer C
-  4. Answer D
-
 Correct answer [number(s) / S]: 3
 ```
 
-Use:
+Use `1,3` for multiple accepted answers, or `S` for an unscored poll.
 
-- a number such as `3` for one correct answer
-- `1,3` if multiple choices should be treated as correct
-- `S` if the question should count for attendance but not scoring
+The Google Sheet is then updated automatically.
 
-After all questions are processed, the shared Google Sheet is updated automatically.
+## Useful commands
 
-## Dry run
-
-To inspect results without modifying the Google Sheet:
+Check Google access without changing data:
 
 ```bash
-python ecs101_poll_importer.py /path/to/csvs --dry-run
+python ecs101_poll_importer.py --check-google
 ```
 
-The program writes preview files to `output_preview_v2/`:
-
-- `roster_preview.csv`
-- `questions_preview.csv`
-- `responses_preview.csv`
-- `import_log_preview.csv`
-- `attendance_preview.csv`
-- `scores_preview.csv`
-- `leaderboard_preview.csv`
-
-## Duplicate protection
-
-Each source CSV is hashed using SHA-256.
-
-If the exact same file has already been imported, the program skips it automatically even if the filename has changed.
-
-Example:
-
-```text
-Exact duplicate file(s) already imported; skipped:
-  - Lecture1_Yellowstone.csv [b31de62f8031]
-```
-
-## Replacing a question
-
-Question IDs are based on:
-
-```text
-class date + CSV filename stem
-```
-
-If a corrected export needs to replace an existing question, run:
+Rebuild Attendance, Attendance Review, Scores, and Leaderboard without importing new files:
 
 ```bash
-python ecs101_poll_importer.py /path/to/csvs --replace
+python ecs101_poll_importer.py --refresh-views
 ```
 
-Use `--replace` intentionally because it replaces the existing records for the matching Question ID.
+Preview Poll CSV processing without writing to Google Sheets:
 
-## Student identity
+```bash
+python ecs101_poll_importer.py /path/to/polls --dry-run
+```
 
-The current Poll Everywhere exports provide a `Registered participant` field, which the importer uses as the student identity.
+For a dry run with a Canvas roster:
 
-If that field is missing, the response is labeled:
+```bash
+python ecs101_poll_importer.py /path/to/polls --dry-run --roster-csv CanvasGrades.csv
+```
+
+Replace an existing question intentionally:
+
+```bash
+python ecs101_poll_importer.py /path/to/polls --replace
+```
+
+## Student identity and attendance review
+
+Poll Everywhere participant names are resolved in this order:
+
+1. saved `Participant Map` entry;
+2. unique exact normalized-name match;
+3. human-reviewed candidate suggestions.
+
+Unresolved participants do **not** get assigned to a student automatically.
+
+`Attendance Review` uses **No matched Poll response** rather than **Absent**, because the data can only establish that no matched Poll response was found. A student may have been present but not answered, had a technical issue, or still have an unresolved identity.
+
+## Privacy
+
+Do not commit course data or Google credentials to GitHub.
+
+The repository `.gitignore` should exclude at least:
 
 ```text
-[UNREGISTERED] ...
+credentials.json
+authorized_user.json
+config.json
+*.csv
+*.xlsx
+output_preview*/
+data/
 ```
 
-rather than guessing the student's identity.
-
-The `Roster` tab can later be used for human-reviewed identity cleanup if needed, especially during the add/drop period.
-
-## v1.1 migration
-
-If the Google Sheet was previously populated by v1.1, v2 can migrate the old `Raw Responses` data automatically.
-
-On the first v2 run:
-
-```text
-Raw Responses
-      ↓
-Responses
-```
-
-and an `Import Log` is created from the existing imports.
-
-The old `Raw Responses` tab is intentionally left untouched as a backup. After v2 has been verified with additional class meetings, it can be hidden or removed manually.
-
-## Privacy and GitHub safety
-
-Poll Everywhere exports may contain identifiable student information.
-
-The repository therefore excludes:
-
-- `credentials.json`
-- `authorized_user.json`
-- `config.json`
-- Poll Everywhere CSV files
-- generated preview CSV files
-- other local course-data folders
-
-Before every push, check:
+Before pushing:
 
 ```bash
 git status
 ```
 
-No student CSV, roster export, OAuth credential, or local configuration file should ever be staged for GitHub.
-
-For this course workflow, the repository should remain private.
+Only code, documentation, and example configuration should be tracked.
