@@ -1,39 +1,54 @@
 #!/usr/bin/env python3
-"""ECS101 Poll Everywhere -> Google Sheets importer (v2).
+"""ECS101 Poll Everywhere -> Google Sheets importer (v2.1.1).
 
 Architecture
 ------------
-Original Poll Everywhere CSVs
+Canvas roster CSV
         ↓
-Python cleaning / deduplication
+Authoritative Roster + persistent Participant Map
+
+Poll Everywhere CSVs
+        ↓
+Python cleaning / identity matching / deduplication
         ↓
 Canonical Google Sheets tables:
     Roster
+    Participant Map
     Questions
     Responses
     Import Log
         ↓
 Automatically rebuilt views:
     Attendance
+    Attendance Review
     Scores
     Leaderboard
 
 Key rules
 ---------
-* Attendance: a student is present on a date if they answered ANY imported
-  Poll Everywhere question that day.
+* Canvas is the authoritative source for enrolled students.
+* A Poll Everywhere participant is linked to a Canvas student by:
+    1) a previously confirmed Participant Map entry,
+    2) an exact normalized-name match, or
+    3) a human-reviewed match for ambiguous names.
+* Fuzzy matching only suggests candidates; it NEVER confirms automatically.
+* Staff/guests can be persistently marked as non-students.
+* Attendance: an ACTIVE Canvas student is present on a date if they answered
+  ANY imported Poll Everywhere question that day.
 * Scored questions: 1 = correct, 0 = incorrect, blank = unanswered.
 * Unscored questions still count toward attendance.
-* Responses contains ONE effective (latest) response per student per question.
-  The original CSV files remain the raw archive.
+* Responses contains one effective (latest) response per identity per question.
+  Original Poll Everywhere CSVs remain the raw archive.
 * Exact duplicate CSVs are detected by SHA-256 file hash, even if renamed.
-* Existing v1.1 "Raw Responses" data can be migrated automatically once.
+* Re-importing a newer Canvas roster marks missing prior students inactive
+  rather than deleting their historical records.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import hashlib
 import html
 import json
@@ -47,7 +62,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = "2.0"
+VERSION = "2.1.1"
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +79,7 @@ class ResponseRow:
 
     @property
     def student_name(self) -> str:
+        """Raw Poll Everywhere participant label used for identity matching."""
         name = self.registered_participant.strip()
         if name:
             return name
@@ -72,7 +88,9 @@ class ResponseRow:
 
     @property
     def student_key(self) -> str:
-        return make_student_key(self.student_name)
+        # Legacy / within-question dedup key only. Production student keys
+        # come from Canvas IDs after participant matching.
+        return normalize_person_name(self.student_name)
 
 
 @dataclass
@@ -87,12 +105,19 @@ class PollFile:
 
     @property
     def question_id(self) -> str:
-        # Date + filename stem is readable and deterministic.
         return f"{self.class_date}::{self.question_name}"
 
     @property
     def scored(self) -> bool:
         return self.correct_answers is not None
+
+
+@dataclass
+class CanvasStudent:
+    student_key: str
+    student_name: str
+    canvas_name: str
+    section: str
 
 
 # ---------------------------------------------------------------------------
@@ -103,15 +128,34 @@ def clean_space(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
-def make_student_key(name: str) -> str:
-    """Create a deterministic key from the Poll Everywhere participant name.
+def strip_diacritics(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in text if not unicodedata.combining(ch))
 
-    This is intentionally conservative: it does not guess that two different
-    spellings are the same student. The Roster tab can later serve as a place
-    for human-reviewed identity management if needed.
-    """
-    normalized = unicodedata.normalize("NFKC", clean_space(name)).casefold()
-    return normalized
+
+def normalize_person_name(name: str) -> str:
+    """Conservative normalized name for exact matching and map lookup."""
+    text = strip_diacritics(clean_space(name)).casefold()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def make_student_key(name: str) -> str:
+    """Legacy name key retained for v1/v2 migration only."""
+    return normalize_person_name(name)
+
+
+def canvas_student_key(canvas_id: str) -> str:
+    return f"canvas:{clean_space(canvas_id)}"
+
+
+def canvas_display_name(canvas_name: str) -> str:
+    """Convert Canvas 'Last, First Middle' to 'First Middle Last'."""
+    raw = clean_space(canvas_name)
+    if "," not in raw:
+        return raw
+    last, given = raw.split(",", 1)
+    return clean_space(f"{given} {last}")
 
 
 def sha256_file(path: Path) -> str:
@@ -125,6 +169,100 @@ def sha256_file(path: Path) -> str:
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
+
+# ---------------------------------------------------------------------------
+# Canvas roster parser
+# ---------------------------------------------------------------------------
+
+def parse_canvas_roster(path: Path) -> List[CanvasStudent]:
+    """Read only roster-identifying fields from a Canvas gradebook export.
+
+    Assignment / grade columns are intentionally ignored.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Canvas roster file not found: {path}")
+
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"Student", "ID"}
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(
+                f"{path.name}: missing Canvas column(s): {', '.join(sorted(missing))}"
+            )
+
+        students: List[CanvasStudent] = []
+        seen_keys = set()
+
+        for row in reader:
+            raw_canvas_name = clean_space(row.get("Student") or "")
+            canvas_id = clean_space(row.get("ID") or "")
+            section = clean_space(row.get("Section") or "")
+
+            # Canvas gradebook exports include a "Points Possible" pseudo-row.
+            if not raw_canvas_name or normalize_person_name(raw_canvas_name) == "points possible":
+                continue
+
+            display = canvas_display_name(raw_canvas_name)
+
+            # Ignore Canvas's synthetic Test Student.
+            if normalize_person_name(display) == "test student":
+                continue
+
+            if not canvas_id:
+                # A real roster row should have a stable Canvas ID.
+                continue
+
+            key = canvas_student_key(canvas_id)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            students.append(
+                CanvasStudent(
+                    student_key=key,
+                    student_name=display,
+                    canvas_name=raw_canvas_name,
+                    section=section,
+                )
+            )
+
+    if not students:
+        raise ValueError(f"No student roster rows found in {path.name}.")
+
+    return sorted(students, key=lambda s: s.student_name.casefold())
+
+
+def name_similarity(a: str, b: str) -> float:
+    """Ranking heuristic for HUMAN REVIEW only; never used for auto-match."""
+    na, nb = normalize_person_name(a), normalize_person_name(b)
+    if not na or not nb:
+        return 0.0
+
+    ratio = difflib.SequenceMatcher(None, na, nb).ratio()
+    ta, tb = na.split(), nb.split()
+    sa, sb = set(ta), set(tb)
+
+    overlap = len(sa & sb) / max(len(sa | sb), 1)
+    surname_bonus = 0.18 if ta[-1] == tb[-1] else 0.0
+    subset_bonus = 0.12 if (sa <= sb or sb <= sa) else 0.0
+
+    return min(1.0, 0.65 * ratio + 0.23 * overlap + surname_bonus + subset_bonus)
+
+
+def roster_candidates(
+    poll_name: str,
+    roster_rows: Sequence[Dict[str, str]],
+    limit: int = 5,
+) -> List[Tuple[float, Dict[str, str]]]:
+    scored: List[Tuple[float, Dict[str, str]]] = []
+    for row in roster_rows:
+        name = clean_space(row.get("Student Name", ""))
+        if not name:
+            continue
+        scored.append((name_similarity(poll_name, name), row))
+    scored.sort(key=lambda x: (-x[0], x[1].get("Student Name", "").casefold()))
+    return scored[:limit]
 
 # ---------------------------------------------------------------------------
 # Poll Everywhere CSV parser
@@ -252,6 +390,7 @@ def prompt_correct_answer(poll: PollFile, index: int, total: int) -> None:
         print(f"Please enter 1-{len(poll.summary)}, a comma-separated list, or S.")
 
 
+
 # ---------------------------------------------------------------------------
 # Canonical records
 # ---------------------------------------------------------------------------
@@ -263,35 +402,262 @@ QUESTION_HEADERS = [
 
 RESPONSE_HEADERS = [
     "Date", "Question ID", "Question",
-    "Student Key", "Student Name", "Screen Name",
+    "Student Key", "Student Name", "Poll Participant", "Screen Name",
     "Response", "Correct", "Timestamp",
-    "Source File", "File Hash",
+    "Source File", "File Hash", "Match Status",
 ]
 
 IMPORT_LOG_HEADERS = [
     "Import ID", "Date", "Source File", "File Hash",
-    "Question ID", "Responses Imported", "Imported At",
+    "Question ID", "Effective Responses", "Matched Students",
+    "Unmatched / Non-student", "Imported At",
 ]
 
 ROSTER_HEADERS = [
-    "Student Key", "Student Name", "Active", "Notes",
+    "Student Key", "Student Name", "Canvas Name", "Section",
+    "Active", "First Seen", "Roster Updated At", "Notes",
+]
+
+PARTICIPANT_MAP_HEADERS = [
+    "Poll Key", "Poll Participant", "Student Key", "Student Name",
+    "Match Type", "Updated At", "Notes",
 ]
 
 
 def effective_poll_responses(poll: PollFile) -> List[ResponseRow]:
-    """Keep the latest response for each student in this question."""
+    """Keep the latest response for each Poll participant in this question."""
     latest: Dict[str, ResponseRow] = {}
     for row in poll.responses:
-        key = row.student_key
+        key = normalize_person_name(row.student_name)
         old = latest.get(key)
         if old is None or row.created_at >= old.created_at:
             latest[key] = row
     return sorted(latest.values(), key=lambda r: (r.student_name.casefold(), r.created_at))
 
 
+def roster_by_key(roster_rows: Sequence[Dict[str, str]]) -> Dict[str, Dict[str, str]]:
+    return {
+        clean_space(r.get("Student Key", "")): r
+        for r in roster_rows
+        if clean_space(r.get("Student Key", ""))
+    }
+
+
+def active_roster_rows(roster_rows: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    return [
+        r for r in roster_rows
+        if str(r.get("Active", "")).strip().upper() != "FALSE"
+        and clean_space(r.get("Student Key", ""))
+    ]
+
+
+def participant_map_index(
+    participant_map_rows: Sequence[Dict[str, str]]
+) -> Dict[str, Dict[str, str]]:
+    idx: Dict[str, Dict[str, str]] = {}
+    for row in participant_map_rows:
+        key = clean_space(row.get("Poll Key", ""))
+        if not key:
+            key = normalize_person_name(row.get("Poll Participant", ""))
+        if key:
+            idx[key] = dict(row)
+    return idx
+
+
+def exact_roster_name_index(
+    roster_rows: Sequence[Dict[str, str]]
+) -> Dict[str, Optional[Dict[str, str]]]:
+    """Normalized name -> row, or None if that exact normalized name is ambiguous."""
+    idx: Dict[str, Optional[Dict[str, str]]] = {}
+    for row in roster_rows:
+        norm = normalize_person_name(row.get("Student Name", ""))
+        if not norm:
+            continue
+        if norm in idx:
+            idx[norm] = None
+        else:
+            idx[norm] = row
+    return idx
+
+
+def make_map_row(
+    poll_name: str,
+    student: Optional[Dict[str, str]],
+    match_type: str,
+    notes: str = "",
+) -> Dict[str, str]:
+    return {
+        "Poll Key": normalize_person_name(poll_name),
+        "Poll Participant": clean_space(poll_name),
+        "Student Key": "" if student is None else clean_space(student.get("Student Key", "")),
+        "Student Name": "" if student is None else clean_space(student.get("Student Name", "")),
+        "Match Type": match_type,
+        "Updated At": now_iso(),
+        "Notes": notes,
+    }
+
+
+def prompt_participant_match(
+    poll_name: str,
+    roster_rows: Sequence[Dict[str, str]],
+) -> Dict[str, str]:
+    print("\n" + "-" * 72)
+    print("Participant match review")
+    print(f"Poll Everywhere: {poll_name}")
+
+    candidates = roster_candidates(poll_name, roster_rows, limit=5)
+    if candidates:
+        print("\nPossible Canvas students:")
+        for i, (score, row) in enumerate(candidates, start=1):
+            active = str(row.get("Active", "")).strip().upper() != "FALSE"
+            status = "active" if active else "inactive"
+            print(
+                f"  {i}. {row.get('Student Name', '')} "
+                f"({status}, similarity {score:.2f})"
+            )
+
+    print("\n  N. Mark as non-student / staff / guest")
+    print("  S. Leave unresolved for now")
+
+    while True:
+        raw = input("Match [number / N / S]: ").strip().casefold()
+        if raw == "n":
+            return make_map_row(poll_name, None, "non-student")
+        if raw == "s":
+            return make_map_row(poll_name, None, "unresolved")
+        try:
+            choice = int(raw)
+        except ValueError:
+            choice = -1
+        if 1 <= choice <= len(candidates):
+            return make_map_row(
+                poll_name,
+                candidates[choice - 1][1],
+                "confirmed",
+            )
+        print("Please choose a candidate number, N, or S.")
+
+
+def resolve_participants(
+    poll_names: Iterable[str],
+    roster_rows: Sequence[Dict[str, str]],
+    participant_map_rows: Sequence[Dict[str, str]],
+    interactive: bool = True,
+) -> Tuple[Dict[str, Dict[str, str]], List[Dict[str, str]], Dict[str, int]]:
+    """Resolve raw Poll names to Canvas students.
+
+    Order:
+      1. existing persistent map
+      2. unique exact normalized-name match
+      3. human review of suggested fuzzy candidates
+
+    Fuzzy matching is NEVER accepted automatically.
+    """
+    roster_idx = roster_by_key(roster_rows)
+    exact_idx = exact_roster_name_index(roster_rows)
+    map_idx = participant_map_index(participant_map_rows)
+
+    stats = defaultdict(int)
+
+    unique_names = sorted(
+        {clean_space(n) for n in poll_names if clean_space(n)},
+        key=str.casefold,
+    )
+
+    for poll_name in unique_names:
+        pkey = normalize_person_name(poll_name)
+
+        existing = map_idx.get(pkey)
+        if existing:
+            mtype = clean_space(existing.get("Match Type", ""))
+            skey = clean_space(existing.get("Student Key", ""))
+
+            if mtype == "non-student":
+                stats["saved_nonstudent"] += 1
+                continue
+
+            if skey and skey in roster_idx:
+                # Refresh official display name in case Canvas changed it.
+                refreshed = dict(existing)
+                refreshed["Student Name"] = roster_idx[skey].get("Student Name", "")
+                map_idx[pkey] = refreshed
+                stats["saved"] += 1
+                continue
+
+            # "unresolved", or stale map to a missing roster key: review again.
+            if mtype == "unresolved":
+                pass
+            elif skey and skey not in roster_idx:
+                print(
+                    f"\nSaved mapping for {poll_name!r} points to a student "
+                    "no longer present in the stored roster. Reviewing again."
+                )
+
+        exact = exact_idx.get(pkey, "__missing__")
+        if exact != "__missing__" and exact is not None:
+            row = make_map_row(poll_name, exact, "exact")
+            map_idx[pkey] = row
+            stats["exact"] += 1
+            continue
+
+        if interactive:
+            row = prompt_participant_match(poll_name, roster_rows)
+            map_idx[pkey] = row
+            if row["Match Type"] == "confirmed":
+                stats["confirmed"] += 1
+            elif row["Match Type"] == "non-student":
+                stats["nonstudent"] += 1
+            else:
+                stats["unresolved"] += 1
+        else:
+            row = make_map_row(poll_name, None, "unresolved")
+            map_idx[pkey] = row
+            stats["unresolved"] += 1
+
+    updated_rows = sorted(
+        map_idx.values(),
+        key=lambda r: r.get("Poll Participant", "").casefold(),
+    )
+    return map_idx, updated_rows, dict(stats)
+
+
+def collapse_canonical_responses(
+    rows: Sequence[Dict[str, str]]
+) -> List[Dict[str, str]]:
+    """One latest effective response per question + canonical identity.
+
+    Matched students collapse by Canvas student key.
+    Non-students / unresolved identities collapse by normalized Poll participant.
+    """
+    latest: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for row in rows:
+        qid = clean_space(row.get("Question ID", ""))
+        skey = clean_space(row.get("Student Key", ""))
+        poll_name = clean_space(
+            row.get("Poll Participant", "") or row.get("Student Name", "")
+        )
+        identity = skey or f"poll:{normalize_person_name(poll_name)}"
+        if not qid or not identity:
+            continue
+        key = (qid, identity)
+        old = latest.get(key)
+        if old is None or row.get("Timestamp", "") >= old.get("Timestamp", ""):
+            latest[key] = dict(row)
+
+    return sorted(
+        latest.values(),
+        key=lambda r: (
+            r.get("Date", ""),
+            r.get("Question ID", ""),
+            (r.get("Student Name", "") or r.get("Poll Participant", "")).casefold(),
+        ),
+    )
+
+
 def poll_to_records(
     poll: PollFile,
     imported_at: str,
+    mapping: Dict[str, Dict[str, str]],
 ) -> Tuple[Dict[str, str], List[Dict[str, str]], Dict[str, str]]:
     correct_text = (
         "" if poll.correct_answers is None
@@ -312,6 +678,12 @@ def poll_to_records(
 
     responses: List[Dict[str, str]] = []
     for r in effective_poll_responses(poll):
+        poll_name = r.student_name
+        map_row = mapping.get(normalize_person_name(poll_name), {})
+        match_type = clean_space(map_row.get("Match Type", "")) or "unresolved"
+        student_key = clean_space(map_row.get("Student Key", ""))
+        student_name = clean_space(map_row.get("Student Name", ""))
+
         correct = ""
         if poll.correct_answers is not None:
             correct = "1" if r.response in poll.correct_answers else "0"
@@ -321,16 +693,24 @@ def poll_to_records(
                 "Date": poll.class_date,
                 "Question ID": poll.question_id,
                 "Question": poll.question_name,
-                "Student Key": r.student_key,
-                "Student Name": r.student_name,
+                "Student Key": student_key,
+                "Student Name": student_name,
+                "Poll Participant": poll_name,
                 "Screen Name": r.screen_name,
                 "Response": r.response,
                 "Correct": correct,
                 "Timestamp": r.created_at,
                 "Source File": poll.path.name,
                 "File Hash": poll.file_hash,
+                "Match Status": match_type,
             }
         )
+
+    responses = collapse_canonical_responses(responses)
+    matched_students = len({
+        r["Student Key"] for r in responses if r.get("Student Key", "")
+    })
+    unmatched = sum(1 for r in responses if not r.get("Student Key", ""))
 
     import_log = {
         "Import ID": poll.file_hash[:12],
@@ -338,7 +718,9 @@ def poll_to_records(
         "Source File": poll.path.name,
         "File Hash": poll.file_hash,
         "Question ID": poll.question_id,
-        "Responses Imported": str(len(responses)),
+        "Effective Responses": str(len(responses)),
+        "Matched Students": str(matched_students),
+        "Unmatched / Non-student": str(unmatched),
         "Imported At": imported_at,
     }
 
@@ -351,59 +733,22 @@ def poll_to_records(
 
 def roster_display_map(
     roster_rows: Sequence[Dict[str, str]],
-    response_rows: Sequence[Dict[str, str]],
 ) -> Tuple[List[str], Dict[str, str]]:
-    """Return ordered student keys + display names.
-
-    Roster order comes first. Students observed in Responses but absent from
-    Roster are appended alphabetically.
-    """
-    display: Dict[str, str] = {}
-    ordered: List[str] = []
-    seen = set()
-
-    for row in roster_rows:
-        key = clean_space(row.get("Student Key", ""))
-        name = clean_space(row.get("Student Name", ""))
-        if not key and name:
-            key = make_student_key(name)
-        if not key:
-            continue
-        if str(row.get("Active", "")).strip().upper() == "FALSE":
-            # Keep inactive students if they have historical responses; they
-            # are added later from response data.
-            continue
-        if key not in seen:
-            seen.add(key)
-            ordered.append(key)
-        display[key] = name or key
-
-    observed: Dict[str, str] = {}
-    for row in response_rows:
-        key = clean_space(row.get("Student Key", ""))
-        name = clean_space(row.get("Student Name", ""))
-        if not key:
-            key = make_student_key(name)
-        if key:
-            observed[key] = name or display.get(key, key)
-
-    for key in sorted(observed, key=lambda k: observed[k].casefold()):
-        if key not in seen:
-            seen.add(key)
-            ordered.append(key)
-        display.setdefault(key, observed[key])
-
+    """Return ACTIVE Canvas roster only, in alphabetical order."""
+    active = active_roster_rows(roster_rows)
+    active.sort(key=lambda r: r.get("Student Name", "").casefold())
+    ordered = [r["Student Key"] for r in active]
+    display = {r["Student Key"]: r.get("Student Name", r["Student Key"]) for r in active}
     return ordered, display
 
 
 def latest_canonical_responses(
     rows: Sequence[Dict[str, str]]
 ) -> Dict[Tuple[str, str], Dict[str, str]]:
-    """Latest canonical row per (question_id, student_key)."""
     latest: Dict[Tuple[str, str], Dict[str, str]] = {}
     for row in rows:
-        qid = row.get("Question ID", "")
-        skey = row.get("Student Key", "") or make_student_key(row.get("Student Name", ""))
+        qid = clean_space(row.get("Question ID", ""))
+        skey = clean_space(row.get("Student Key", ""))
         if not qid or not skey:
             continue
         key = (qid, skey)
@@ -418,7 +763,7 @@ def build_derived_tables(
     responses: Sequence[Dict[str, str]],
     roster_rows: Sequence[Dict[str, str]],
 ) -> Tuple[List[List[str]], List[List[str]], List[List[str]]]:
-    students, display = roster_display_map(roster_rows, responses)
+    students, display = roster_display_map(roster_rows)
 
     dates = sorted({q.get("Date", "") for q in questions if q.get("Date", "")})
     scored_questions = [
@@ -429,20 +774,24 @@ def build_derived_tables(
         key=lambda q: (q.get("Date", ""), q.get("Question ID", ""))
     )
 
-    # Attendance is derived from ANY response on that class date.
+    active_keys = set(students)
+
+    # Attendance is derived only from matched ACTIVE Canvas students.
     attended = {
-        (
-            r.get("Student Key", "") or make_student_key(r.get("Student Name", "")),
-            r.get("Date", ""),
-        )
+        (clean_space(r.get("Student Key", "")), r.get("Date", ""))
         for r in responses
-        if r.get("Date", "")
+        if clean_space(r.get("Student Key", "")) in active_keys
+        and r.get("Date", "")
     }
 
     attendance = [["Student", *dates, "Classes Attended"]]
     for skey in students:
         vals = ["P" if (skey, d) in attended else "" for d in dates]
-        attendance.append([display.get(skey, skey), *vals, str(sum(v == "P" for v in vals))])
+        attendance.append([
+            display.get(skey, skey),
+            *vals,
+            str(sum(v == "P" for v in vals)),
+        ])
 
     latest = latest_canonical_responses(responses)
     q_labels = [
@@ -452,7 +801,7 @@ def build_derived_tables(
 
     scores = [[
         "Student", *q_labels,
-        "Total Correct", "Questions Answered", "Accuracy"
+        "Total Correct", "Questions Answered", "Accuracy",
     ]]
 
     leaderboard_data: List[Tuple[str, int, int, Optional[float]]] = []
@@ -492,7 +841,7 @@ def build_derived_tables(
     )
 
     leaderboard = [[
-        "Rank", "Student", "Total Correct", "Questions Answered", "Accuracy"
+        "Rank", "Student", "Total Correct", "Questions Answered", "Accuracy",
     ]]
     last_score: Optional[int] = None
     rank = 0
@@ -512,6 +861,128 @@ def build_derived_tables(
 
     return attendance, scores, leaderboard
 
+
+def build_attendance_review(
+    questions: Sequence[Dict[str, str]],
+    responses: Sequence[Dict[str, str]],
+    roster_rows: Sequence[Dict[str, str]],
+) -> List[List[str]]:
+    """Build a review-oriented attendance sheet from canonical data.
+
+    The view deliberately says "No matched Poll response" rather than
+    "Absent". The importer can prove only that an active Canvas student did
+    not have a matched response in the imported Poll Everywhere data. A student
+    may have been physically present but not answered a poll, had a technical
+    issue, or still have an unresolved Poll identity.
+
+    The sheet contains three sections:
+      1. class-level counts,
+      2. one row per active Canvas student per class date,
+      3. unmatched Poll identities that may explain discrepancies.
+    """
+    active = active_roster_rows(roster_rows)
+    active.sort(key=lambda r: r.get("Student Name", "").casefold())
+    active_keys = {clean_space(r.get("Student Key", "")) for r in active}
+
+    dates = sorted({q.get("Date", "") for q in questions if q.get("Date", "")})
+
+    # A matched response from an active Canvas student is evidence of presence.
+    present_by_date: Dict[str, set[str]] = defaultdict(set)
+    unresolved_by_date: Dict[str, set[str]] = defaultdict(set)
+    nonstudent_by_date: Dict[str, set[str]] = defaultdict(set)
+
+    for row in responses:
+        date = clean_space(row.get("Date", ""))
+        if not date:
+            continue
+
+        skey = clean_space(row.get("Student Key", ""))
+        if skey in active_keys:
+            present_by_date[date].add(skey)
+            continue
+
+        poll_name = clean_space(row.get("Poll Participant", ""))
+        status = clean_space(row.get("Match Status", "")).casefold()
+        if not poll_name:
+            continue
+        if status == "non-student":
+            nonstudent_by_date[date].add(poll_name)
+        else:
+            # Includes explicit unresolved rows and any legacy unmatched row.
+            unresolved_by_date[date].add(poll_name)
+
+    matrix: List[List[str]] = []
+
+    # Section 1: quick class-level audit.
+    matrix.append(["Class Summary"])
+    matrix.append([
+        "Date",
+        "Active Canvas Roster",
+        "Present",
+        "No matched Poll response",
+        "Unresolved Poll participants",
+        "Non-student participants",
+    ])
+    for date in dates:
+        present = len(present_by_date.get(date, set()))
+        missing = max(len(active) - present, 0)
+        matrix.append([
+            date,
+            str(len(active)),
+            str(present),
+            str(missing),
+            str(len(unresolved_by_date.get(date, set()))),
+            str(len(nonstudent_by_date.get(date, set()))),
+        ])
+
+    matrix.append([])
+    matrix.append(["Student Attendance Review"])
+    matrix.append([
+        "Date", "Student Key", "Student", "Status", "Notes"
+    ])
+
+    # Missing students appear first within each date so the actionable rows are
+    # immediately visible. Present students remain in the table for a complete
+    # audit trail and easy filtering.
+    for date in dates:
+        present_keys = present_by_date.get(date, set())
+        detail_rows = []
+        for student in active:
+            skey = clean_space(student.get("Student Key", ""))
+            name = clean_space(student.get("Student Name", ""))
+            if skey in present_keys:
+                status = "Present"
+                notes = "Matched response to at least one imported poll"
+                sort_order = 1
+            else:
+                status = "No matched Poll response"
+                notes = (
+                    "Review if needed; unresolved Poll identities may later "
+                    "change this status"
+                )
+                sort_order = 0
+            detail_rows.append((sort_order, name.casefold(), [
+                date, skey, name, status, notes
+            ]))
+        for _, _, row in sorted(detail_rows):
+            matrix.append(row)
+
+    matrix.append([])
+    matrix.append(["Unmatched Poll Identities"])
+    matrix.append(["Date", "Poll Participant", "Status", "Notes"])
+    for date in dates:
+        for name in sorted(unresolved_by_date.get(date, set()), key=str.casefold):
+            matrix.append([
+                date, name, "Unresolved",
+                "Not currently linked to an active Canvas student",
+            ])
+        for name in sorted(nonstudent_by_date.get(date, set()), key=str.casefold):
+            matrix.append([
+                date, name, "Non-student",
+                "Excluded from student attendance and scores",
+            ])
+
+    return matrix
 
 # ---------------------------------------------------------------------------
 # Local dry-run previews
@@ -630,9 +1101,32 @@ def write_matrix_to_ws(ws, matrix: Sequence[Sequence[str]]) -> None:
         pass
 
 
+
 # ---------------------------------------------------------------------------
-# v1.1 -> v2 migration
+# Legacy migration helpers
 # ---------------------------------------------------------------------------
+
+def normalize_response_schema(row: Dict[str, str]) -> Dict[str, str]:
+    """Upgrade a v2/v1-style response row into the v2.1 schema."""
+    poll_participant = clean_space(
+        row.get("Poll Participant", "") or row.get("Student Name", "")
+    )
+    return {
+        "Date": row.get("Date", ""),
+        "Question ID": row.get("Question ID", ""),
+        "Question": row.get("Question", ""),
+        "Student Key": clean_space(row.get("Student Key", "")),
+        "Student Name": clean_space(row.get("Student Name", "")),
+        "Poll Participant": poll_participant,
+        "Screen Name": row.get("Screen Name", ""),
+        "Response": row.get("Response", ""),
+        "Correct": row.get("Correct", ""),
+        "Timestamp": row.get("Timestamp", ""),
+        "Source File": row.get("Source File", ""),
+        "File Hash": row.get("File Hash", ""),
+        "Match Status": row.get("Match Status", ""),
+    }
+
 
 def migrate_v1_raw_responses_if_needed(
     spreadsheet,
@@ -640,11 +1134,13 @@ def migrate_v1_raw_responses_if_needed(
     import_log_ws,
     questions: Sequence[Dict[str, str]],
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], bool]:
-    """Migrate v1.1 Raw Responses once if v2 Responses is empty.
+    """Migrate v1.1 Raw Responses once if Responses is empty.
 
     The old Raw Responses tab is left untouched as a backup.
     """
-    existing_responses = worksheet_records(responses_ws)
+    existing_responses = [
+        normalize_response_schema(r) for r in worksheet_records(responses_ws)
+    ]
     existing_log = worksheet_records(import_log_ws)
     if existing_responses:
         return existing_responses, existing_log, False
@@ -660,39 +1156,36 @@ def migrate_v1_raw_responses_if_needed(
     if not old_rows:
         return existing_responses, existing_log, False
 
-    # Keep one latest effective response per question/student.
     latest: Dict[Tuple[str, str], Dict[str, str]] = {}
     for row in old_rows:
-        student_name = clean_space(row.get("Student", ""))
-        if not student_name:
+        poll_name = clean_space(row.get("Student", ""))
+        if not poll_name:
             continue
-        skey = make_student_key(student_name)
         converted = {
             "Date": row.get("Date", ""),
             "Question ID": row.get("Question ID", ""),
             "Question": row.get("Question", ""),
-            "Student Key": skey,
-            "Student Name": student_name,
+            "Student Key": clean_space(row.get("Student Key", "")),
+            "Student Name": poll_name,
+            "Poll Participant": poll_name,
             "Screen Name": row.get("Screen Name", ""),
             "Response": row.get("Response", ""),
             "Correct": row.get("Correct", ""),
             "Timestamp": row.get("Timestamp", ""),
             "Source File": row.get("Source File", ""),
             "File Hash": row.get("File Hash", ""),
+            "Match Status": "",
         }
-        key = (converted["Question ID"], skey)
+        key = (
+            converted["Question ID"],
+            normalize_person_name(poll_name),
+        )
         old = latest.get(key)
         if old is None or converted["Timestamp"] >= old.get("Timestamp", ""):
             latest[key] = converted
 
-    migrated = list(latest.values())
-    migrated.sort(key=lambda r: (
-        r.get("Date", ""),
-        r.get("Question ID", ""),
-        r.get("Student Name", "").casefold(),
-    ))
+    migrated = collapse_canonical_responses(list(latest.values()))
 
-    # Build an import log from existing Questions.
     imported_at = now_iso()
     logs: List[Dict[str, str]] = []
     by_qid_count = defaultdict(int)
@@ -711,7 +1204,9 @@ def migrate_v1_raw_responses_if_needed(
             "Source File": q.get("Source File", ""),
             "File Hash": file_hash,
             "Question ID": q.get("Question ID", ""),
-            "Responses Imported": str(by_qid_count[q.get("Question ID", "")]),
+            "Effective Responses": str(by_qid_count[q.get("Question ID", "")]),
+            "Matched Students": "",
+            "Unmatched / Non-student": "",
             "Imported At": q.get("Imported At", "") or imported_at,
         })
 
@@ -725,8 +1220,258 @@ def migrate_v1_raw_responses_if_needed(
     return migrated, logs, True
 
 
+def remap_existing_responses(
+    response_rows: Sequence[Dict[str, str]],
+    mapping: Dict[str, Dict[str, str]],
+) -> List[Dict[str, str]]:
+    remapped: List[Dict[str, str]] = []
+
+    for original in response_rows:
+        row = normalize_response_schema(original)
+        poll_name = clean_space(
+            row.get("Poll Participant", "") or row.get("Student Name", "")
+        )
+        map_row = mapping.get(normalize_person_name(poll_name), {})
+        match_type = clean_space(map_row.get("Match Type", "")) or "unresolved"
+
+        if map_row.get("Student Key", ""):
+            row["Student Key"] = clean_space(map_row.get("Student Key", ""))
+            row["Student Name"] = clean_space(map_row.get("Student Name", ""))
+        else:
+            row["Student Key"] = ""
+            row["Student Name"] = ""
+
+        row["Poll Participant"] = poll_name
+        row["Match Status"] = match_type
+        remapped.append(row)
+
+    return collapse_canonical_responses(remapped)
+
+
 # ---------------------------------------------------------------------------
-# Google synchronization
+# Canvas roster synchronization
+# ---------------------------------------------------------------------------
+
+def build_updated_roster(
+    canvas_students: Sequence[CanvasStudent],
+    existing_roster: Sequence[Dict[str, str]],
+    synced_at: str,
+) -> Tuple[List[Dict[str, str]], Dict[str, int]]:
+    existing_canvas = {
+        clean_space(r.get("Student Key", "")): r
+        for r in existing_roster
+        if clean_space(r.get("Student Key", "")).startswith("canvas:")
+    }
+
+    current_keys = {s.student_key for s in canvas_students}
+    updated: Dict[str, Dict[str, str]] = {}
+    stats = defaultdict(int)
+
+    for student in canvas_students:
+        old = existing_canvas.get(student.student_key)
+        if old:
+            stats["retained"] += 1
+            first_seen = old.get("First Seen", "") or synced_at
+            notes = old.get("Notes", "")
+        else:
+            stats["added"] += 1
+            first_seen = synced_at
+            notes = ""
+
+        updated[student.student_key] = {
+            "Student Key": student.student_key,
+            "Student Name": student.student_name,
+            "Canvas Name": student.canvas_name,
+            "Section": student.section,
+            "Active": "TRUE",
+            "First Seen": first_seen,
+            "Roster Updated At": synced_at,
+            "Notes": notes,
+        }
+
+    # Prior Canvas students who disappeared from the new roster remain as
+    # historical identities, but become inactive.
+    for key, old in existing_canvas.items():
+        if key in current_keys:
+            continue
+        stats["inactivated"] += 1
+        updated[key] = {
+            "Student Key": key,
+            "Student Name": old.get("Student Name", key),
+            "Canvas Name": old.get("Canvas Name", ""),
+            "Section": old.get("Section", ""),
+            "Active": "FALSE",
+            "First Seen": old.get("First Seen", ""),
+            "Roster Updated At": synced_at,
+            "Notes": old.get("Notes", ""),
+        }
+
+    rows = sorted(
+        updated.values(),
+        key=lambda r: (
+            str(r.get("Active", "")).upper() == "FALSE",
+            r.get("Student Name", "").casefold(),
+        ),
+    )
+    return rows, dict(stats)
+
+
+def ensure_course_worksheets(sh):
+    return {
+        "roster": ensure_worksheet(sh, "Roster"),
+        "participant_map": ensure_worksheet(sh, "Participant Map"),
+        "questions": ensure_worksheet(sh, "Questions"),
+        "responses": ensure_worksheet(sh, "Responses"),
+        "import_log": ensure_worksheet(sh, "Import Log"),
+        "attendance": ensure_worksheet(sh, "Attendance"),
+        "attendance_review": ensure_worksheet(sh, "Attendance Review"),
+        "scores": ensure_worksheet(sh, "Scores"),
+        "leaderboard": ensure_worksheet(sh, "Leaderboard"),
+    }
+
+
+def sync_canvas_roster(
+    canvas_path: Path,
+    config: Dict[str, str],
+) -> None:
+    canvas_students = parse_canvas_roster(canvas_path)
+
+    gc = get_google_client(config)
+    spreadsheet_id = clean_space(config.get("spreadsheet_id", ""))
+    if not spreadsheet_id or spreadsheet_id == "PASTE_GOOGLE_SHEET_ID_HERE":
+        raise ValueError("Please set spreadsheet_id in config.json.")
+
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = ensure_course_worksheets(sh)
+
+    existing_roster = worksheet_records(ws["roster"])
+    existing_questions = worksheet_records(ws["questions"])
+    existing_responses, existing_log, migrated = migrate_v1_raw_responses_if_needed(
+        sh, ws["responses"], ws["import_log"], existing_questions
+    )
+    participant_map_rows = worksheet_records(ws["participant_map"])
+
+    synced_at = now_iso()
+    updated_roster, roster_stats = build_updated_roster(
+        canvas_students, existing_roster, synced_at
+    )
+
+    if migrated:
+        print("\nMigrated existing v1.1 data before roster matching.")
+        print("The old Raw Responses tab was left untouched as a backup.")
+
+    # Reconcile every previously observed Poll identity with the authoritative
+    # Canvas roster. This is what migrates current v2 name-based keys to IDs.
+    historical_poll_names = {
+        clean_space(
+            r.get("Poll Participant", "") or r.get("Student Name", "")
+        )
+        for r in existing_responses
+        if clean_space(r.get("Poll Participant", "") or r.get("Student Name", ""))
+    }
+
+    mapping, updated_map_rows, match_stats = resolve_participants(
+        historical_poll_names,
+        updated_roster,
+        participant_map_rows,
+        interactive=True,
+    )
+
+    remapped_responses = remap_existing_responses(existing_responses, mapping)
+
+    # Refresh legacy import-log match counts where possible.
+    responses_by_qid = defaultdict(list)
+    for row in remapped_responses:
+        responses_by_qid[row.get("Question ID", "")].append(row)
+
+    normalized_logs: List[Dict[str, str]] = []
+    for old in existing_log:
+        qid = old.get("Question ID", "")
+        qrows = responses_by_qid.get(qid, [])
+        normalized_logs.append({
+            "Import ID": old.get("Import ID", "") or old.get("File Hash", "")[:12],
+            "Date": old.get("Date", ""),
+            "Source File": old.get("Source File", ""),
+            "File Hash": old.get("File Hash", ""),
+            "Question ID": qid,
+            "Effective Responses": old.get(
+                "Effective Responses",
+                old.get("Responses Imported", str(len(qrows))),
+            ),
+            "Matched Students": str(len({
+                r.get("Student Key", "") for r in qrows if r.get("Student Key", "")
+            })),
+            "Unmatched / Non-student": str(sum(
+                1 for r in qrows if not r.get("Student Key", "")
+            )),
+            "Imported At": old.get("Imported At", ""),
+        })
+
+    attendance, scores, leaderboard = build_derived_tables(
+        existing_questions, remapped_responses, updated_roster
+    )
+    attendance_review = build_attendance_review(
+        existing_questions, remapped_responses, updated_roster
+    )
+
+    write_matrix_to_ws(
+        ws["roster"], dicts_to_matrix(updated_roster, ROSTER_HEADERS)
+    )
+    write_matrix_to_ws(
+        ws["participant_map"],
+        dicts_to_matrix(updated_map_rows, PARTICIPANT_MAP_HEADERS),
+    )
+    write_matrix_to_ws(
+        ws["responses"],
+        dicts_to_matrix(remapped_responses, RESPONSE_HEADERS),
+    )
+    write_matrix_to_ws(
+        ws["import_log"],
+        dicts_to_matrix(normalized_logs, IMPORT_LOG_HEADERS),
+    )
+    write_matrix_to_ws(ws["attendance"], attendance)
+    write_matrix_to_ws(ws["attendance_review"], attendance_review)
+    write_matrix_to_ws(ws["scores"], scores)
+    write_matrix_to_ws(ws["leaderboard"], leaderboard)
+
+    active_count = len(active_roster_rows(updated_roster))
+    inactive_count = len(updated_roster) - active_count
+    matched_existing = len({
+        r.get("Student Key", "") for r in remapped_responses
+        if r.get("Student Key", "")
+    })
+    excluded_existing = sum(
+        1 for r in remapped_responses if not r.get("Student Key", "")
+    )
+
+    print("\n" + "=" * 72)
+    print("Canvas roster sync complete")
+    print("=" * 72)
+    print(f"Source: {canvas_path.name}")
+    print(f"Active Canvas students: {active_count}")
+    print(f"Inactive historical students: {inactive_count}")
+    print(f"New roster students: {roster_stats.get('added', 0)}")
+    print(f"Previously known roster students retained: {roster_stats.get('retained', 0)}")
+    print(f"Students marked inactive: {roster_stats.get('inactivated', 0)}")
+
+    if historical_poll_names:
+        print("\nExisting Poll Everywhere identity reconciliation:")
+        print(f"  Exact matches added: {match_stats.get('exact', 0)}")
+        print(f"  Saved mappings reused: {match_stats.get('saved', 0)}")
+        print(f"  Human-confirmed matches: {match_stats.get('confirmed', 0)}")
+        print(
+            "  Non-student / staff / guest: "
+            f"{match_stats.get('nonstudent', 0) + match_stats.get('saved_nonstudent', 0)}"
+        )
+        print(f"  Left unresolved: {match_stats.get('unresolved', 0)}")
+        print(f"  Matched historical students represented: {matched_existing}")
+        print(f"  Historical unmatched/non-student responses: {excluded_existing}")
+
+    print(f"\nGoogle Sheet updated: {sh.title}")
+
+
+# ---------------------------------------------------------------------------
+# Poll import synchronization
 # ---------------------------------------------------------------------------
 
 def sync_google_sheet(
@@ -740,31 +1485,52 @@ def sync_google_sheet(
         raise ValueError("Please set spreadsheet_id in config.json.")
 
     sh = gc.open_by_key(spreadsheet_id)
+    ws = ensure_course_worksheets(sh)
 
-    roster_ws = ensure_worksheet(sh, "Roster")
-    questions_ws = ensure_worksheet(sh, "Questions")
-    responses_ws = ensure_worksheet(sh, "Responses")
-    import_log_ws = ensure_worksheet(sh, "Import Log")
-    attendance_ws = ensure_worksheet(sh, "Attendance")
-    scores_ws = ensure_worksheet(sh, "Scores")
-    leaderboard_ws = ensure_worksheet(sh, "Leaderboard")
+    roster_rows = worksheet_records(ws["roster"])
+    if not any(
+        clean_space(r.get("Student Key", "")).startswith("canvas:")
+        for r in roster_rows
+    ):
+        raise RuntimeError(
+            "No authoritative Canvas roster is loaded.\n"
+            "Run first:\n"
+            "  python ecs101_poll_importer.py --import-roster CanvasGrades.csv"
+        )
 
-    # Initialize Roster if empty.
-    roster_rows = worksheet_records(roster_ws)
-    if not roster_rows and not roster_ws.get_all_values():
-        write_matrix_to_ws(roster_ws, [ROSTER_HEADERS])
-
-    existing_questions = worksheet_records(questions_ws)
+    existing_questions = worksheet_records(ws["questions"])
     existing_responses, existing_log, migrated = migrate_v1_raw_responses_if_needed(
-        sh, responses_ws, import_log_ws, existing_questions
+        sh, ws["responses"], ws["import_log"], existing_questions
     )
-    roster_rows = worksheet_records(roster_ws)
+    participant_map_rows = worksheet_records(ws["participant_map"])
 
     if migrated:
         print("\nMigrated existing v1.1 data:")
         print("  Raw Responses -> Responses")
         print("  Existing imports -> Import Log")
         print("  The old Raw Responses tab was left untouched as a backup.")
+
+    # Normalize any old v2 rows. If they are not mapped yet, resolve them now.
+    existing_responses = [
+        normalize_response_schema(r) for r in existing_responses
+    ]
+    historical_unmapped_names = {
+        r.get("Poll Participant", "")
+        for r in existing_responses
+        if not clean_space(r.get("Student Key", "")).startswith("canvas:")
+        and clean_space(r.get("Poll Participant", ""))
+        and clean_space(r.get("Match Status", "")) != "non-student"
+    }
+    if historical_unmapped_names:
+        historical_mapping, participant_map_rows, _ = resolve_participants(
+            historical_unmapped_names,
+            roster_rows,
+            participant_map_rows,
+            interactive=True,
+        )
+        existing_responses = remap_existing_responses(
+            existing_responses, historical_mapping
+        )
 
     existing_hashes = {
         row.get("File Hash", "")
@@ -777,7 +1543,6 @@ def sync_google_sheet(
         if row.get("Question ID", "")
     }
 
-    # Decide which incoming polls are actually new before scoring has any effect.
     exact_duplicates: List[PollFile] = []
     qid_conflicts: List[PollFile] = []
     candidates: List[PollFile] = []
@@ -828,15 +1593,40 @@ def sync_google_sheet(
             print(f"  - {qid}")
 
     if not candidates:
-        # Still rebuild views in case Roster or canonical data changed manually.
         attendance, scores, leaderboard = build_derived_tables(
             existing_questions, existing_responses, roster_rows
         )
-        write_matrix_to_ws(attendance_ws, attendance)
-        write_matrix_to_ws(scores_ws, scores)
-        write_matrix_to_ws(leaderboard_ws, leaderboard)
+        attendance_review = build_attendance_review(
+            existing_questions, existing_responses, roster_rows
+        )
+        write_matrix_to_ws(
+            ws["participant_map"],
+            dicts_to_matrix(participant_map_rows, PARTICIPANT_MAP_HEADERS),
+        )
+        write_matrix_to_ws(
+            ws["responses"], dicts_to_matrix(
+                collapse_canonical_responses(existing_responses), RESPONSE_HEADERS
+            )
+        )
+        write_matrix_to_ws(ws["attendance"], attendance)
+        write_matrix_to_ws(ws["attendance_review"], attendance_review)
+        write_matrix_to_ws(ws["scores"], scores)
+        write_matrix_to_ws(ws["leaderboard"], leaderboard)
         print(f"\nNo new files to import. Views refreshed in: {sh.title}")
         return
+
+    incoming_poll_names = {
+        r.student_name
+        for poll in candidates
+        for r in effective_poll_responses(poll)
+    }
+
+    mapping, updated_map_rows, match_stats = resolve_participants(
+        incoming_poll_names,
+        roster_rows,
+        participant_map_rows,
+        interactive=True,
+    )
 
     imported_at = now_iso()
     incoming_questions: List[Dict[str, str]] = []
@@ -844,88 +1634,83 @@ def sync_google_sheet(
     incoming_logs: List[Dict[str, str]] = []
 
     for poll in candidates:
-        q, responses, log = poll_to_records(poll, imported_at)
+        q, responses, log = poll_to_records(poll, imported_at, mapping)
         incoming_questions.append(q)
         incoming_responses.extend(responses)
         incoming_logs.append(log)
 
     all_questions = [*existing_questions, *incoming_questions]
-    all_responses = [*existing_responses, *incoming_responses]
+    all_responses = collapse_canonical_responses([
+        *existing_responses, *incoming_responses
+    ])
     all_logs = [*existing_log, *incoming_logs]
 
     all_questions.sort(key=lambda q: (
         q.get("Date", ""),
         q.get("Question ID", ""),
     ))
-    all_responses.sort(key=lambda r: (
-        r.get("Date", ""),
-        r.get("Question ID", ""),
-        r.get("Student Name", "").casefold(),
-    ))
     all_logs.sort(key=lambda r: (
         r.get("Date", ""),
         r.get("Source File", "").casefold(),
     ))
 
-    # Auto-add newly observed students to Roster. Human edits to Active/Notes
-    # are preserved for existing rows.
-    roster_by_key: Dict[str, Dict[str, str]] = {}
-    for row in roster_rows:
-        key = clean_space(row.get("Student Key", ""))
-        name = clean_space(row.get("Student Name", ""))
-        if not key and name:
-            key = make_student_key(name)
-        if key:
-            roster_by_key[key] = {
-                "Student Key": key,
-                "Student Name": name or key,
-                "Active": row.get("Active", "") or "TRUE",
-                "Notes": row.get("Notes", ""),
-            }
-
-    for row in incoming_responses:
-        key = row["Student Key"]
-        if key not in roster_by_key:
-            roster_by_key[key] = {
-                "Student Key": key,
-                "Student Name": row["Student Name"],
-                "Active": "TRUE",
-                "Notes": "",
-            }
-
-    updated_roster = sorted(
-        roster_by_key.values(),
-        key=lambda r: r["Student Name"].casefold()
-    )
-
     attendance, scores, leaderboard = build_derived_tables(
-        all_questions, all_responses, updated_roster
+        all_questions, all_responses, roster_rows
+    )
+    attendance_review = build_attendance_review(
+        all_questions, all_responses, roster_rows
     )
 
-    # Canonical tables.
     write_matrix_to_ws(
-        roster_ws, dicts_to_matrix(updated_roster, ROSTER_HEADERS)
+        ws["questions"], dicts_to_matrix(all_questions, QUESTION_HEADERS)
     )
     write_matrix_to_ws(
-        questions_ws, dicts_to_matrix(all_questions, QUESTION_HEADERS)
+        ws["responses"], dicts_to_matrix(all_responses, RESPONSE_HEADERS)
     )
     write_matrix_to_ws(
-        responses_ws, dicts_to_matrix(all_responses, RESPONSE_HEADERS)
+        ws["import_log"], dicts_to_matrix(all_logs, IMPORT_LOG_HEADERS)
     )
     write_matrix_to_ws(
-        import_log_ws, dicts_to_matrix(all_logs, IMPORT_LOG_HEADERS)
+        ws["participant_map"],
+        dicts_to_matrix(updated_map_rows, PARTICIPANT_MAP_HEADERS),
     )
+    write_matrix_to_ws(ws["attendance"], attendance)
+    write_matrix_to_ws(ws["attendance_review"], attendance_review)
+    write_matrix_to_ws(ws["scores"], scores)
+    write_matrix_to_ws(ws["leaderboard"], leaderboard)
 
-    # Rebuildable views.
-    write_matrix_to_ws(attendance_ws, attendance)
-    write_matrix_to_ws(scores_ws, scores)
-    write_matrix_to_ws(leaderboard_ws, leaderboard)
+    active_keys = {
+        r["Student Key"] for r in active_roster_rows(roster_rows)
+    }
+    incoming_matched_active = {
+        r.get("Student Key", "")
+        for r in incoming_responses
+        if r.get("Student Key", "") in active_keys
+    }
+    incoming_excluded = {
+        normalize_person_name(r.get("Poll Participant", ""))
+        for r in incoming_responses
+        if not r.get("Student Key", "")
+    }
 
     print(f"\nGoogle Sheet updated: {sh.title}")
     print(f"Imported files: {len(candidates)}")
     print(f"Canonical questions: {len(all_questions)}")
     print(f"Canonical responses: {len(all_responses)}")
-    print(f"Students in roster: {len(updated_roster)}")
+    print(f"Active students in roster: {len(active_keys)}")
+    print(f"Active enrolled students participating in this batch: {len(incoming_matched_active)}")
+    print(f"Unmatched / non-student participant identities in this batch: {len(incoming_excluded)}")
+
+    if match_stats:
+        print("\nParticipant matching:")
+        print(f"  Exact matches added: {match_stats.get('exact', 0)}")
+        print(f"  Saved mappings reused: {match_stats.get('saved', 0)}")
+        print(f"  Human-confirmed matches: {match_stats.get('confirmed', 0)}")
+        print(
+            "  Non-student / staff / guest: "
+            f"{match_stats.get('nonstudent', 0) + match_stats.get('saved_nonstudent', 0)}"
+        )
+        print(f"  Left unresolved: {match_stats.get('unresolved', 0)}")
 
 
 def check_google_connection(config: Dict[str, str]) -> None:
@@ -938,6 +1723,49 @@ def check_google_connection(config: Dict[str, str]) -> None:
     print(f"Spreadsheet: {sh.title}")
     print("No spreadsheet data were changed.")
 
+
+def refresh_google_views(config: Dict[str, str]) -> None:
+    """Rebuild derived views from existing canonical Google Sheet data.
+
+    This does not import a roster or a Poll CSV and does not change canonical
+    Roster / Participant Map / Questions / Responses / Import Log records.
+    """
+    gc = get_google_client(config)
+    spreadsheet_id = clean_space(config.get("spreadsheet_id", ""))
+    if not spreadsheet_id or spreadsheet_id == "PASTE_GOOGLE_SHEET_ID_HERE":
+        raise ValueError("Please set spreadsheet_id in config.json.")
+
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = ensure_course_worksheets(sh)
+
+    roster_rows = worksheet_records(ws["roster"])
+    questions = worksheet_records(ws["questions"])
+    responses = [normalize_response_schema(r) for r in worksheet_records(ws["responses"])]
+
+    if not any(
+        clean_space(r.get("Student Key", "")).startswith("canvas:")
+        for r in roster_rows
+    ):
+        raise RuntimeError(
+            "No authoritative Canvas roster is loaded. Run --import-roster first."
+        )
+
+    attendance, scores, leaderboard = build_derived_tables(
+        questions, responses, roster_rows
+    )
+    attendance_review = build_attendance_review(
+        questions, responses, roster_rows
+    )
+
+    write_matrix_to_ws(ws["attendance"], attendance)
+    write_matrix_to_ws(ws["attendance_review"], attendance_review)
+    write_matrix_to_ws(ws["scores"], scores)
+    write_matrix_to_ws(ws["leaderboard"], leaderboard)
+
+    print("\nDerived views refreshed successfully.")
+    print(f"Spreadsheet: {sh.title}")
+    print("Updated: Attendance, Attendance Review, Scores, Leaderboard")
+    print("Canonical data were not changed.")
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -960,7 +1788,7 @@ def discover_csvs(input_path: Path) -> List[Path]:
 
 def print_batch_summary(polls: Sequence[PollFile]) -> None:
     all_students = {
-        r.student_key
+        normalize_person_name(r.student_name)
         for p in polls
         for r in effective_poll_responses(p)
     }
@@ -971,7 +1799,7 @@ def print_batch_summary(polls: Sequence[PollFile]) -> None:
     print("=" * 72)
     print(f"CSV files found: {len(polls)}")
     print(f"Class date(s): {', '.join(dates)}")
-    print(f"Unique participants across all questions: {len(all_students)}")
+    print(f"Unique Poll Everywhere participants: {len(all_students)}")
 
     unregistered = sorted({
         r.student_name
@@ -983,18 +1811,77 @@ def print_batch_summary(polls: Sequence[PollFile]) -> None:
         print(f"WARNING: {len(unregistered)} unregistered participant(s) found.")
 
 
+def pseudo_roster_and_mapping_for_legacy_dry_run(
+    polls: Sequence[PollFile],
+) -> Tuple[List[Dict[str, str]], Dict[str, Dict[str, str]], List[Dict[str, str]]]:
+    """Backward-compatible parser preview when no Canvas roster is supplied."""
+    names = sorted({
+        r.student_name
+        for p in polls
+        for r in effective_poll_responses(p)
+    }, key=str.casefold)
+
+    roster = []
+    mapping_rows = []
+    mapping = {}
+    stamp = now_iso()
+
+    for name in names:
+        key = f"preview:{normalize_person_name(name)}"
+        roster_row = {
+            "Student Key": key,
+            "Student Name": name,
+            "Canvas Name": "",
+            "Section": "",
+            "Active": "TRUE",
+            "First Seen": stamp,
+            "Roster Updated At": stamp,
+            "Notes": "Dry-run pseudo roster; not for production.",
+        }
+        map_row = {
+            "Poll Key": normalize_person_name(name),
+            "Poll Participant": name,
+            "Student Key": key,
+            "Student Name": name,
+            "Match Type": "dry-run-only",
+            "Updated At": stamp,
+            "Notes": "",
+        }
+        roster.append(roster_row)
+        mapping_rows.append(map_row)
+        mapping[normalize_person_name(name)] = map_row
+
+    return roster, mapping, mapping_rows
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Import Poll Everywhere CSVs into normalized Google Sheets tables "
-            "and rebuild attendance/scores/leaderboard."
+            "Import a Canvas roster and Poll Everywhere CSVs into normalized "
+            "Google Sheets tables, then rebuild attendance/scores/leaderboard."
         )
     )
     parser.add_argument(
         "input",
         nargs="?",
         default=".",
-        help="Folder containing Poll Everywhere CSVs, or one CSV file.",
+        help="Folder containing Poll Everywhere CSVs, or one Poll CSV file.",
+    )
+    parser.add_argument(
+        "--import-roster",
+        metavar="CANVAS_CSV",
+        help=(
+            "Sync the authoritative student roster from a Canvas gradebook CSV. "
+            "Missing previously rostered students are marked inactive."
+        ),
+    )
+    parser.add_argument(
+        "--roster-csv",
+        metavar="CANVAS_CSV",
+        help=(
+            "For --dry-run only: use this Canvas roster locally for participant "
+            "matching without writing Google Sheets."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -1003,7 +1890,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "--output-dir",
-        default="output_preview_v2",
+        default="output_preview_v2_1",
         help="Preview folder for --dry-run.",
     )
     parser.add_argument(
@@ -1021,6 +1908,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="Verify Google Sheet access without importing data.",
     )
+    parser.add_argument(
+        "--refresh-views",
+        action="store_true",
+        help=(
+            "Rebuild Attendance, Attendance Review, Scores, and Leaderboard "
+            "from existing canonical Google Sheet data without importing files."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.check_google:
@@ -1032,11 +1927,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 3
         return 0
 
+    if args.refresh_views:
+        try:
+            config = load_config(Path(args.config).expanduser().resolve())
+            refresh_google_views(config)
+        except Exception as exc:
+            print(f"ERROR while refreshing views: {exc}", file=sys.stderr)
+            return 3
+        return 0
+
+    if args.import_roster:
+        if args.dry_run:
+            try:
+                students = parse_canvas_roster(
+                    Path(args.import_roster).expanduser().resolve()
+                )
+                print(f"Canvas roster parsed successfully: {len(students)} students.")
+                print("No Google Sheet data were changed.")
+                return 0
+            except Exception as exc:
+                print(f"ERROR while reading Canvas roster: {exc}", file=sys.stderr)
+                return 2
+
+        try:
+            config = load_config(Path(args.config).expanduser().resolve())
+            sync_canvas_roster(
+                Path(args.import_roster).expanduser().resolve(),
+                config,
+            )
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled. No roster changes were written.")
+            return 130
+        except Exception as exc:
+            print(f"\nERROR while syncing Canvas roster: {exc}", file=sys.stderr)
+            return 3
+        return 0
+
     try:
         csv_paths = discover_csvs(Path(args.input).expanduser().resolve())
         polls = [parse_poll_everywhere_csv(p) for p in csv_paths]
     except Exception as exc:
-        print(f"ERROR while reading CSV files: {exc}", file=sys.stderr)
+        print(f"ERROR while reading Poll Everywhere CSV files: {exc}", file=sys.stderr)
         return 2
 
     print_batch_summary(polls)
@@ -1052,89 +1983,114 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 130
 
     imported_at = now_iso()
-    preview_questions: List[Dict[str, str]] = []
-    preview_responses: List[Dict[str, str]] = []
-    preview_logs: List[Dict[str, str]] = []
-
-    for poll in polls:
-        q, responses, log = poll_to_records(poll, imported_at)
-        preview_questions.append(q)
-        preview_responses.extend(responses)
-        preview_logs.append(log)
-
-    print("\n" + "=" * 72)
-    print("Batch summary")
-    print("=" * 72)
-    for poll in polls:
-        effective = effective_poll_responses(poll)
-        if poll.scored:
-            correct = sum(
-                1 for r in effective
-                if r.response in (poll.correct_answers or set())
-            )
-            print(
-                f"{poll.path.name}: "
-                f"{len(effective)} effective responses, {correct} correct"
-            )
-        else:
-            print(
-                f"{poll.path.name}: "
-                f"{len(effective)} effective responses, scoring skipped"
-            )
-
-    print(
-        "Attendance this batch: "
-        f"{len({r['Student Key'] for r in preview_responses})} unique students"
-    )
 
     if args.dry_run:
-        out = Path(args.output_dir).expanduser().resolve()
-        out.mkdir(parents=True, exist_ok=True)
+        try:
+            if args.roster_csv:
+                students = parse_canvas_roster(
+                    Path(args.roster_csv).expanduser().resolve()
+                )
+                roster_rows, _ = build_updated_roster(students, [], imported_at)
+                poll_names = {
+                    r.student_name
+                    for p in polls
+                    for r in effective_poll_responses(p)
+                }
+                mapping, map_rows, _ = resolve_participants(
+                    poll_names,
+                    roster_rows,
+                    [],
+                    interactive=True,
+                )
+            else:
+                print(
+                    "\nNOTE: no --roster-csv supplied. Dry run will use temporary "
+                    "name-based identities. Production imports require the Canvas roster."
+                )
+                roster_rows, mapping, map_rows = (
+                    pseudo_roster_and_mapping_for_legacy_dry_run(polls)
+                )
 
-        preview_roster = [{
-            "Student Key": r["Student Key"],
-            "Student Name": r["Student Name"],
-            "Active": "TRUE",
-            "Notes": "",
-        } for r in {
-            r["Student Key"]: r for r in preview_responses
-        }.values()]
-        preview_roster.sort(key=lambda r: r["Student Name"].casefold())
+            preview_questions: List[Dict[str, str]] = []
+            preview_responses: List[Dict[str, str]] = []
+            preview_logs: List[Dict[str, str]] = []
 
-        attendance, scores, leaderboard = build_derived_tables(
-            preview_questions, preview_responses, preview_roster
-        )
+            for poll in polls:
+                q, responses, log = poll_to_records(
+                    poll, imported_at, mapping
+                )
+                preview_questions.append(q)
+                preview_responses.extend(responses)
+                preview_logs.append(log)
 
-        write_dict_csv(
-            out / "questions_preview.csv",
-            preview_questions,
-            QUESTION_HEADERS,
-        )
-        write_dict_csv(
-            out / "responses_preview.csv",
-            preview_responses,
-            RESPONSE_HEADERS,
-        )
-        write_dict_csv(
-            out / "import_log_preview.csv",
-            preview_logs,
-            IMPORT_LOG_HEADERS,
-        )
-        write_dict_csv(
-            out / "roster_preview.csv",
-            preview_roster,
-            ROSTER_HEADERS,
-        )
-        write_csv_matrix(out / "attendance_preview.csv", attendance)
-        write_csv_matrix(out / "scores_preview.csv", scores)
-        write_csv_matrix(out / "leaderboard_preview.csv", leaderboard)
+            preview_responses = collapse_canonical_responses(preview_responses)
+            attendance, scores, leaderboard = build_derived_tables(
+                preview_questions, preview_responses, roster_rows
+            )
+            attendance_review = build_attendance_review(
+                preview_questions, preview_responses, roster_rows
+            )
 
-        print(f"\nDry run complete. Preview files written to:\n  {out}")
-        return 0
+            out = Path(args.output_dir).expanduser().resolve()
+            out.mkdir(parents=True, exist_ok=True)
+
+            write_dict_csv(
+                out / "roster_preview.csv",
+                roster_rows,
+                ROSTER_HEADERS,
+            )
+            write_dict_csv(
+                out / "participant_map_preview.csv",
+                map_rows,
+                PARTICIPANT_MAP_HEADERS,
+            )
+            write_dict_csv(
+                out / "questions_preview.csv",
+                preview_questions,
+                QUESTION_HEADERS,
+            )
+            write_dict_csv(
+                out / "responses_preview.csv",
+                preview_responses,
+                RESPONSE_HEADERS,
+            )
+            write_dict_csv(
+                out / "import_log_preview.csv",
+                preview_logs,
+                IMPORT_LOG_HEADERS,
+            )
+            write_csv_matrix(out / "attendance_preview.csv", attendance)
+            write_csv_matrix(
+                out / "attendance_review_preview.csv", attendance_review
+            )
+            write_csv_matrix(out / "scores_preview.csv", scores)
+            write_csv_matrix(out / "leaderboard_preview.csv", leaderboard)
+
+            print("\n" + "=" * 72)
+            print("Dry-run batch summary")
+            print("=" * 72)
+            print(f"Questions: {len(polls)}")
+            print(f"Canonical responses: {len(preview_responses)}")
+            print(
+                "Matched roster students represented: "
+                f"{len({r['Student Key'] for r in preview_responses if r.get('Student Key', '')})}"
+            )
+            print(f"\nPreview files written to:\n  {out}")
+            return 0
+
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled. No data were written.")
+            return 130
+        except Exception as exc:
+            print(f"ERROR during dry run: {exc}", file=sys.stderr)
+            return 2
 
     try:
         config = load_config(Path(args.config).expanduser().resolve())
         sync_google_sheet(polls, config, replace=args.replace)
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled. No new poll data were written.")
+        return 130
     except Exception as exc:
         print(f"\nERROR while updating Google Sheets: {exc}", file=sys.stderr)
         print("Original Poll Everywhere CSV files were not modified.", file=sys.stderr)
