@@ -1,8 +1,8 @@
 # ECS101 Poll Everywhere Importer
 
-A small Python tool for maintaining the ECS101 **attendance, daily trivia score, and leaderboard** in a shared Google Sheet.
+A Python tool for maintaining the ECS101 **attendance, daily trivia score, and leaderboard** in a shared Google Sheet.
 
-**Current version: v2.3.1**
+**Current version: v3.0.0**
 
 ## Course rules
 
@@ -36,7 +36,7 @@ Attendance / Attendance Review / Scores / Leaderboard
 shared Google Sheet
 ```
 
-Canvas is the authoritative roster. Poll Everywhere participant names are matched to Canvas students before they count toward attendance or scores.
+Canvas is the authoritative roster. Poll Everywhere participants are matched to Canvas students before they count toward attendance or scores.
 
 ## Normal weekly workflow
 
@@ -59,45 +59,64 @@ python ecs101_poll_importer.py polls/2026-08-26/Lecture2_Kamchatka.csv
 The importer will:
 
 1. detect the questions in their exported order;
-2. propose question 1 as the scored question;
-3. ask the TA to confirm it;
-4. ask for the correct answer to question 1;
-5. treat all later questions as attendance-only;
-6. match participants to the Canvas roster; and
-7. update the shared Google Sheet.
+2. check the response times against the scheduled class window;
+3. propose question 1 as the scored question;
+4. ask the TA to confirm it;
+5. ask for the correct answer to question 1, and refuse an answer that matches no student response;
+6. treat all later questions as attendance-only;
+7. match participants to the Canvas roster, prompting only for identities it cannot resolve; and
+8. update the shared Google Sheet in one batched write.
 
-## Canvas roster
+## Participant identity matching
 
-Import or refresh the authoritative roster with:
+Matching runs strictest first. Fuzzy name similarity only ranks candidates for a human. It never confirms a match on its own.
 
-```bash
-python ecs101_poll_importer.py --import-roster rosters/final_canvas.csv
-```
+1. **Saved Participant Map entry.** Looked up by e-mail first, then by name.
+2. **Canvas login or e-mail.** Requires a `SIS Login ID`, `Login ID` or `Email` column in the Canvas export. Purely numeric columns such as `SIS User ID` are stored but never used for matching, since a number cannot legitimately equal an e-mail local part.
+3. **A `first.last@` address reconstructed to a name.** The address is turned back into a name and matched against the roster only when it decomposes cleanly. A NetID form such as `ab123@` or an initial form such as `a.surname@` yields nothing rather than a guess.
+4. **Unique exact normalized name.** Diacritics stripped, punctuation collapsed. An ambiguous name never auto-matches.
+5. **Human review.**
 
-Name matching follows this order:
+**E-mail is the identity key** where the export provides one. A student who changes their Poll Everywhere display name between lectures keeps the same key, so their saved mapping and their history follow them instead of becoming a new unresolved identity.
 
-1. reuse a saved `Participant Map` entry;
-2. accept a unique exact normalized-name match;
-3. ask for human review when the identity is ambiguous.
-
-Fuzzy matching only suggests candidates. It never confirms a match automatically.
+In practice most participants resolve with no human input at all: saved mappings carry over week to week, and an institutional `first.last@` address matches the roster exactly. What reaches a human is the genuinely ambiguous case, such as one student answering from several addresses under several name spellings.
 
 During review:
 
 ```text
-1-5  choose a Canvas student
-N    mark as non-student / staff / guest
-S    leave unresolved for now
+1-8        choose a Canvas student
+F <text>   search the roster by name or login
+#<id>      match by Canvas ID directly
+N          mark as non-student / staff / guest (asks for confirmation)
+S          leave unresolved for now
 ```
 
-Confirmed mappings are saved for future imports. Students missing from a later Canvas roster are marked inactive rather than deleted.
+`N` is the one irreversible choice: a participant marked non-student is never asked about again and never counts toward attendance. It asks for confirmation for that reason. If the right student is not in the candidate list, use `F` or `#`, not `N`.
+
+Confirmed mappings are saved for future imports. Every confirmation is also appended to a local journal file as it is made, so an interrupted review resumes where it stopped instead of discarding the answers already given.
+
+Students missing from a later Canvas roster are marked inactive rather than deleted.
+
+### Identities confirmed later are backfilled
+
+When an identity is confirmed in a later week, the stored responses from earlier weeks are re-mapped in the same run. The student's earlier attendance and trivia score come back automatically. Nothing needs to be re-imported.
+
+## Timezone handling
+
+Poll Everywhere writes its export timezone into the column header, for example `Started At (CDT)`. The importer reads that label, converts to the course timezone, and stores timestamps with an explicit UTC offset.
+
+The legacy single-question format states no timezone anywhere. Set `poll_export_timezone` in `config.json` to tell the importer what clock those files use.
+
+Set `class_start` and `class_end` and every import is checked against them. If the median response time drifts outside the scheduled window, the importer says so and asks before continuing. This is what catches a changed Poll Everywhere account timezone, a mislabelled export, or a wrong `course_timezone`, any of which could otherwise file a lecture under a shifted clock or a shifted date without a word.
+
+For ECS101 as configured (1:25 pm to 2:40 pm Eastern, exports in CDT), the one-hour offset never crosses midnight, so class dates were correct under v2.x as well. The check exists so that stays true.
 
 ## Google Sheet structure
 
 ### Canonical data
 
-- **Roster** — Canvas student roster
-- **Participant Map** — persistent Poll Everywhere → Canvas identity mappings
+- **Roster** — Canvas student roster, including any login or e-mail alias
+- **Participant Map** — persistent Poll Everywhere to Canvas identity mappings, keyed by e-mail where available
 - **Questions** — question metadata, order, scoring status, and correct answer
 - **Responses** — one effective response per identity per question
 - **Import Log** — import history and duplicate protection
@@ -105,11 +124,11 @@ Confirmed mappings are saved for future imports. Students missing from a later C
 ### Rebuilt views
 
 - **Attendance** — `P` if the student answered any question that day
-- **Attendance Review** — students with no matched Poll response plus unresolved identities
+- **Attendance Review** — students with no matched Poll response, plus unresolved identities
 - **Scores** — first-question score for each class date
 - **Leaderboard** — cumulative correct answers, scored questions answered, and accuracy
 
-`Attendance Review` deliberately uses **No matched Poll response** rather than **Absent**, because the Poll data alone cannot prove physical absence.
+`Attendance Review` deliberately says **No matched Poll response** rather than **Absent**, because the Poll data alone cannot prove physical absence. It lists only the students who need a look; the present ones are already in `Attendance`.
 
 ## Useful commands
 
@@ -125,11 +144,11 @@ Dry run without writing to Google Sheets:
 python ecs101_poll_importer.py polls/2026-08-26/Lecture2_Kamchatka.csv --dry-run
 ```
 
-Dry run with a Canvas roster:
+Dry run with a Canvas roster, no prompts at all:
 
 ```bash
 python ecs101_poll_importer.py polls/2026-08-26/Lecture2_Kamchatka.csv \
-  --dry-run \
+  --dry-run --non-interactive \
   --roster-csv rosters/2026-08-25_canvas.csv
 ```
 
@@ -139,6 +158,14 @@ Rebuild derived views from existing Google Sheet data:
 python ecs101_poll_importer.py --refresh-views
 ```
 
+Re-apply the Participant Map to Responses after editing it by hand, then rebuild views:
+
+```bash
+python ecs101_poll_importer.py --remap-identities
+```
+
+`--refresh-views` rebuilds views only and never touches canonical data. `--remap-identities` is the one that rewrites `Responses`.
+
 Replace a corrected question intentionally:
 
 ```bash
@@ -147,18 +174,93 @@ python ecs101_poll_importer.py /path/to/export.csv --replace
 
 ## Setup
 
-Python 3.10+ is recommended.
+Python 3.9 or newer. 3.10+ recommended.
 
 ```bash
 python -m pip install -r requirements.txt
 cp config.example.json config.json
 ```
 
-`config.json` should contain the shared spreadsheet ID and local OAuth filenames. The project uses a Google Desktop OAuth client with Google Sheets API access.
+### config.json
+
+| Setting | Required | Meaning |
+| --- | --- | --- |
+| `spreadsheet_id` | yes | The long token in the Sheet's URL between `/d/` and `/edit` |
+| `credentials_file` | no | Google Desktop OAuth client file. Default `credentials.json` |
+| `authorized_user_file` | no | Cached OAuth token. Default `authorized_user.json` |
+| `course_timezone` | no | IANA name for the course's own clock. Default `America/New_York` |
+| `poll_export_timezone` | no | Timezone abbreviation for exports that do not label their own clock, e.g. `CDT`. A label in the file always wins |
+| `class_start` / `class_end` | no | `HH:MM` in `course_timezone`. Set both or neither. Enables the timezone check |
+| `backup_dir` | no | Where pre-write backups and resume journals go. Default `backups` |
+
+Unknown settings are rejected by name, so a typo says what is wrong instead of surfacing as an OAuth error.
+
+## Reliability
+
+Every import backs the canonical tabs up to `backups/<timestamp>/` before writing anything.
+
+All tabs are written together: the grids grow, then one `values.batchUpdate` writes every tab, then only the rows below the new data are cleared. A canonical tab is never empty at any point, and the whole import costs about four Google Sheets API calls rather than the roughly fifty-four that v2.x needed against a sixty-per-minute quota. Quota and transient errors are retried with backoff.
+
+If a run does fail after writing began, the importer says so explicitly and points at the backup, rather than reporting that nothing was written.
+
+## Development
+
+```text
+ecs101_poll_importer.py    entry point, unchanged interface
+ecs101/
+    normalize.py           text, name, answer, e-mail and timestamp normalization
+    models.py              dataclasses and table schemas
+    parsers.py             Canvas roster and both Poll Everywhere formats
+    identity.py            participant matching and interactive review
+    records.py             canonical record building, collapse, remap
+    views.py               Attendance, Scores, Leaderboard, Attendance Review
+    scoring.py             scored-question selection and the correct-answer guard
+    sheets.py              the only module that imports gspread
+    pipeline.py            orchestration
+    cli.py                 argparse and dispatch
+tools/compare_views.py     diff two view exports, for verifying an upgrade
+tests/                     pytest, no network, no Google account
+```
+
+Only `sheets.py` and `pipeline.py` touch Google. Everything else takes plain data and returns plain data, which is what makes the tests possible.
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+`tools/compare_views.py` diffs two Attendance, Scores or Leaderboard CSV
+exports and names the students whose records differ. Use it to see what an
+upgrade or a re-import changes before trusting it:
+
+```bash
+python ecs101_poll_importer.py polls/ --dry-run \
+    --roster-csv rosters/canvas.csv --output-dir preview
+python tools/compare_views.py ~/Downloads/Attendance.csv preview/attendance_preview.csv
+```
+
+`tests/test_regressions.py` holds one test per defect found in the v2.3.1 review. Each of them fails against v2.3.1 and passes here. Run the suite before every change.
+
+## Upgrading from v2.x
+
+No manual migration is needed. The first run reads the existing sheet, upgrades every row in memory, and writes the new schema back.
+
+- Participant Map rows keyed by a bare name are re-keyed and keep working.
+- Response rows from v1 (`Student` column) and v2 (`Poll Participant` column) are both read.
+- `Responses` drops the `Question` and `Source File` columns and stores a 12-character `File Hash` prefix. All three are reachable from `Questions` through `Question ID`, which already embeds the question text. On a full semester this removes roughly a third of what gets rewritten on every import.
+
+**Recommended first step after upgrading.** Run `--import-roster` with your current Canvas CSV once. That reconciles every stored Poll identity against the roster and backfills any attendance that v2.x left unmatched.
 
 ## Privacy
 
-Do not commit student data or Google credentials to GitHub. The repository should exclude at least:
+Every person in `tests/` is invented, and the addresses use the `example.edu`
+and `example.com` domains that RFC 2606 reserves. Real student names and
+addresses must never enter the test fixtures, the docstrings or this README,
+even as illustrative examples. The fixtures reproduce the *shapes* the importer
+has to handle (hyphenated surnames, word-order variation, NetID versus
+first.last addresses, one person with several addresses) using invented people.
+
+Do not commit student data or Google credentials to GitHub. The repository excludes at least:
 
 ```text
 credentials.json
@@ -169,6 +271,7 @@ config.json
 polls/
 rosters/
 output_preview*/
+backups/
 data/
 ```
 

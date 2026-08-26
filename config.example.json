@@ -1,5 +1,10 @@
 {
   "spreadsheet_id": "PASTE_GOOGLE_SHEET_ID_HERE",
   "credentials_file": "credentials.json",
-  "authorized_user_file": "authorized_user.json"
+  "authorized_user_file": "authorized_user.json",
+  "course_timezone": "America/New_York",
+  "poll_export_timezone": "CDT",
+  "class_start": "13:25",
+  "class_end": "14:40",
+  "backup_dir": "backups"
 }

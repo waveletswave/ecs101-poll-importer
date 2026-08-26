@@ -9,6 +9,7 @@ config.json
 data/
 output_preview*/
 output_preview_v2/
+output_preview_v3/
 
 # Python
 __pycache__/
@@ -20,6 +21,10 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# Backups and resume journals (contain student data)
+backups/
+*.journal.jsonl
 
 # Logs / temporary files
 *.log
