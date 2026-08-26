@@ -24,3 +24,5 @@ venv/
 # Logs / temporary files
 *.log
 *.tmp
+polls/
+rosters/

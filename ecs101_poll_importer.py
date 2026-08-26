@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ECS101 Poll Everywhere -> Google Sheets importer (v2.1.1).
+"""ECS101 Poll Everywhere -> Google Sheets importer (v2.3.1).
 
 Architecture
 ------------
@@ -35,8 +35,15 @@ Key rules
 * Staff/guests can be persistently marked as non-students.
 * Attendance: an ACTIVE Canvas student is present on a date if they answered
   ANY imported Poll Everywhere question that day.
-* Scored questions: 1 = correct, 0 = incorrect, blank = unanswered.
-* Unscored questions still count toward attendance.
+* Poll Everywhere may export an entire lecture in one CSV: participant metadata
+  followed by one column per question. v2.3 also retains support for the older
+  one-question-per-CSV export used earlier in the semester.
+* Exactly ONE question per class date is scored: the first question in the
+  lecture-wide CSV (column order). For legacy multi-file exports, the fallback
+  is the question with the earliest response timestamp.
+* The TA confirms the detected first question and enters only its correct answer.
+  All later questions are automatically attendance-only.
+* Scored question: 1 = correct, 0 = incorrect, blank = unanswered.
 * Responses contains one effective (latest) response per identity per question.
   Original Poll Everywhere CSVs remain the raw archive.
 * Exact duplicate CSVs are detected by SHA-256 file hash, even if renamed.
@@ -62,7 +69,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = "2.1.1"
+VERSION = "2.3.1"
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +109,8 @@ class PollFile:
     responses: List[ResponseRow]
     file_hash: str
     correct_answers: Optional[set[str]] = None
+    question_order: int = 1
+    source_format: str = "single-question"
 
     @property
     def question_id(self) -> str:
@@ -110,6 +119,16 @@ class PollFile:
     @property
     def scored(self) -> bool:
         return self.correct_answers is not None
+
+    @property
+    def first_response_at(self) -> str:
+        """Earliest Poll Everywhere response timestamp for ordering questions."""
+        timestamps = [
+            clean_space(r.created_at)
+            for r in self.responses
+            if clean_space(r.created_at)
+        ]
+        return min(timestamps) if timestamps else ""
 
 
 @dataclass
@@ -275,18 +294,139 @@ def _find_line(lines: Sequence[str], prefix: str) -> int:
     raise ValueError(f"Could not find expected section beginning with: {prefix!r}")
 
 
-def parse_poll_everywhere_csv(path: Path) -> PollFile:
-    """Parse the Poll Everywhere CSV format observed in ECS101 exports."""
+def _parse_started_at(raw: str) -> str:
+    """Normalize a lecture-export Started At value to sortable ISO local time."""
+    value = clean_space(raw)
+    if not value:
+        return ""
+    formats = (
+        "%m/%d/%y %H:%M:%S", "%m/%d/%y %H:%M",
+        "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M",
+        "%m/%d/%y %I:%M:%S %p", "%m/%d/%y %I:%M %p",
+        "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %I:%M %p",
+    )
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(value, fmt)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            pass
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.isoformat(timespec="seconds")
+    except ValueError:
+        raise ValueError(f"Unrecognized Poll Everywhere timestamp: {value!r}")
+
+
+def _looks_like_lecture_export(path: Path) -> bool:
+    """Detect Poll Everywhere's one-lecture-per-CSV response export."""
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, [])
+    normalized = {clean_space(h) for h in header}
+    return (
+        "Response #" in normalized
+        and "Participant First Name" in normalized
+        and "Participant Last Name" in normalized
+        and any(h.startswith("Started At") for h in normalized)
+    )
+
+
+def _lecture_question_columns(headers: Sequence[str]) -> List[str]:
+    """Return question columns in the exact order exported by Poll Everywhere."""
+    clean_headers = [clean_space(h) for h in headers]
+    if "Public ID" in clean_headers:
+        idx = clean_headers.index("Public ID")
+        questions = [h for h in clean_headers[idx + 1:] if h]
+        if questions:
+            return questions
+    known_metadata = {
+        "Response #", "Participant First Name", "Participant Last Name",
+        "Email", "Custom Report ID", "Screen Name", "Public ID",
+    }
+    return [
+        h for h in clean_headers
+        if h and h not in known_metadata and not h.startswith("Started At")
+    ]
+
+
+def _parse_lecture_export(path: Path) -> List[PollFile]:
+    """Parse one Poll Everywhere CSV containing all questions from a lecture.
+
+    Only nonblank question cells create response records. Therefore attendance
+    means a student actually answered at least one question, not merely that a
+    participant/session row existed in the export.
+    """
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        headers = reader.fieldnames or []
+        question_columns = _lecture_question_columns(headers)
+        if not question_columns:
+            raise ValueError(f"{path.name}: no question columns were detected.")
+        started_header = next(
+            (h for h in headers if clean_space(h).startswith("Started At")), None
+        )
+        if not started_header:
+            raise ValueError(f"{path.name}: missing Started At column.")
+        rows = [row for row in reader if any(clean_space(v or "") for v in row.values())]
+
+    if not rows:
+        raise ValueError(f"{path.name}: no participant rows found.")
+
+    parsed_times = [
+        _parse_started_at(row.get(started_header) or "")
+        for row in rows
+        if clean_space(row.get(started_header) or "")
+    ]
+    dates = sorted({ts[:10] for ts in parsed_times if len(ts) >= 10})
+    if len(dates) != 1:
+        raise ValueError(f"{path.name}: expected one class date, found {dates or 'none'}.")
+
+    class_date = dates[0]
+    file_hash = sha256_file(path)
+    polls: List[PollFile] = []
+
+    for question_order, question in enumerate(question_columns, start=1):
+        responses: List[ResponseRow] = []
+        counts: Dict[str, int] = defaultdict(int)
+        for row in rows:
+            answer = html.unescape(clean_space(row.get(question) or ""))
+            if not answer:
+                continue
+            first = clean_space(row.get("Participant First Name") or "")
+            last = clean_space(row.get("Participant Last Name") or "")
+            participant_name = clean_space(f"{first} {last}")
+            responses.append(
+                ResponseRow(
+                    response=answer,
+                    via="",
+                    screen_name=clean_space(row.get("Screen Name") or ""),
+                    registered_participant=participant_name,
+                    created_at=_parse_started_at(row.get(started_header) or ""),
+                )
+            )
+            counts[answer] += 1
+
+        summary = sorted(counts.items(), key=lambda x: (-x[1], x[0].casefold()))
+        polls.append(
+            PollFile(
+                path=path, question_name=question, class_date=class_date,
+                summary=summary, responses=responses, file_hash=file_hash,
+                question_order=question_order, source_format="lecture-wide",
+            )
+        )
+    return polls
+
+
+def _parse_single_question_export(path: Path) -> PollFile:
+    """Parse the older ECS101 one-question-per-CSV Poll Everywhere export."""
     text = path.read_text(encoding="utf-8-sig")
     lines = text.splitlines()
-
     summary_header = _find_line(lines, "Response,Count")
     individual_header = _find_line(
         lines, "Response,Via,Screen name,Registered participant,Created At"
     )
 
-    # Poll Everywhere HTML-escapes quotes in the summary. Because answers can
-    # contain commas, parse each summary row from the final comma.
     summary_lines: List[str] = []
     for line in lines[summary_header:individual_header - 1]:
         if line.strip() == "Individual Results":
@@ -324,71 +464,157 @@ def parse_poll_everywhere_csv(path: Path) -> PollFile:
                 created_at=clean_space(row.get("Created At") or ""),
             )
         )
-
     if not responses:
         raise ValueError(f"No Individual Results rows found in {path.name}.")
-
     dates = sorted({r.created_at[:10] for r in responses if len(r.created_at) >= 10})
     if len(dates) != 1:
-        raise ValueError(
-            f"{path.name}: expected one class date, found {dates or 'none'}."
-        )
-
+        raise ValueError(f"{path.name}: expected one class date, found {dates or 'none'}.")
     return PollFile(
-        path=path,
-        question_name=path.stem,
-        class_date=dates[0],
-        summary=summary,
-        responses=responses,
-        file_hash=sha256_file(path),
+        path=path, question_name=path.stem, class_date=dates[0],
+        summary=summary, responses=responses, file_hash=sha256_file(path),
+        question_order=1, source_format="single-question",
     )
 
 
+def parse_poll_everywhere_export(path: Path) -> List[PollFile]:
+    """Parse either supported Poll Everywhere export format into questions."""
+    if _looks_like_lecture_export(path):
+        return _parse_lecture_export(path)
+    return [_parse_single_question_export(path)]
+
+
 # ---------------------------------------------------------------------------
-# Interactive scoring
+# Daily scoring setup
 # ---------------------------------------------------------------------------
 
-def prompt_correct_answer(poll: PollFile, index: int, total: int) -> None:
+def _display_poll_time(timestamp: str) -> str:
+    raw = clean_space(timestamp)
+    if not raw:
+        return "time unavailable"
+    if "T" in raw:
+        return raw.split("T", 1)[1]
+    if " " in raw:
+        return raw.split(" ", 1)[1]
+    return raw
+
+
+def prompt_correct_answer(poll: PollFile) -> None:
+    """Ask for the correct answer to the one scored question for a class date."""
     print("\n" + "-" * 72)
-    print(f"Question {index} of {total}")
-    print(f"File: {poll.path.name}")
-    print(f"Date: {poll.class_date}")
-    print(f"Responses: {len(poll.responses)}")
+    print(f"SCORED question for {poll.class_date}")
+    print(f"Question: {poll.question_name}")
+    print(f"Source: {poll.path.name}")
+    print(f"Responses: {len(effective_poll_responses(poll))}")
 
     if not poll.summary:
         counts: Dict[str, int] = defaultdict(int)
         for row in poll.responses:
-            counts[row.response] += 1
+            if clean_space(row.response):
+                counts[row.response] += 1
         poll.summary = sorted(counts.items(), key=lambda x: (-x[1], x[0].casefold()))
 
-    for i, (answer, count) in enumerate(poll.summary, start=1):
-        print(f"  {i}. {answer}  ({count})")
+    if poll.summary:
+        print("\nObserved answer choices:")
+        for i, (answer, count) in enumerate(poll.summary, start=1):
+            print(f"  {i}. {answer}  ({count})")
+    else:
+        print("\nNo nonblank answers were observed for this question.")
 
     print("\nEnter the correct option number.")
     print("Multiple correct options: use commas, e.g. 1,3.")
-    print("Enter S if this question counts for attendance but is NOT scored.")
-
+    print("Enter T to type the correct answer text manually.")
     while True:
-        raw = input("Correct answer [number(s) / S]: ").strip()
-        if raw.casefold() == "s":
-            poll.correct_answers = None
-            print("  -> Scoring skipped.")
-            return
-
+        raw = input("Correct answer [number(s) / T]: ").strip()
+        if raw.casefold() == "t":
+            manual = clean_space(input("Correct answer text: "))
+            if manual:
+                poll.correct_answers = {manual}
+                print(f"  -> Correct answer: {manual}")
+                return
+            print("Please enter nonblank answer text.")
+            continue
         try:
             choices = [int(x.strip()) for x in raw.split(",") if x.strip()]
         except ValueError:
             choices = []
-
-        if choices and all(1 <= x <= len(poll.summary) for x in choices):
-            poll.correct_answers = {
-                poll.summary[x - 1][0] for x in sorted(set(choices))
-            }
+        if choices and poll.summary and all(1 <= x <= len(poll.summary) for x in choices):
+            poll.correct_answers = {poll.summary[x - 1][0] for x in sorted(set(choices))}
             print("  -> Correct answer(s): " + "; ".join(sorted(poll.correct_answers)))
             return
+        if poll.summary:
+            print(f"Please enter 1-{len(poll.summary)}, a comma-separated list, or T.")
+        else:
+            print("Please enter T and type the correct answer text.")
 
-        print(f"Please enter 1-{len(poll.summary)}, a comma-separated list, or S.")
 
+def _day_poll_order(day_polls: Sequence[PollFile]) -> List[PollFile]:
+    lecture_wide = [p for p in day_polls if p.source_format == "lecture-wide"]
+    if lecture_wide:
+        return sorted(
+            day_polls,
+            key=lambda p: (
+                0 if p.source_format == "lecture-wide" else 1,
+                p.question_order if p.source_format == "lecture-wide" else 10**6,
+                p.first_response_at, p.question_name.casefold(),
+            ),
+        )
+    return sorted(day_polls, key=lambda p: (p.first_response_at, p.path.name.casefold()))
+
+
+def configure_daily_scoring(polls: Sequence[PollFile]) -> None:
+    """Choose exactly one scored question per class date."""
+    by_date: Dict[str, List[PollFile]] = defaultdict(list)
+    for poll in polls:
+        by_date[poll.class_date].append(poll)
+
+    for class_date in sorted(by_date):
+        day_polls = _day_poll_order(by_date[class_date])
+        for poll in day_polls:
+            poll.correct_answers = None
+        selected = day_polls[0]
+        is_lecture_wide = selected.source_format == "lecture-wide"
+
+        print("\n" + "=" * 72)
+        print(f"Daily scoring setup: {class_date}")
+        print("=" * 72)
+        if is_lecture_wide:
+            print("Question order detected from lecture CSV columns:")
+            for i, poll in enumerate(day_polls, start=1):
+                marker = "  [proposed scored question]" if i == 1 else "  [attendance only]"
+                print(f"  {i}. {poll.question_name}{marker}")
+        else:
+            print("Legacy export: question order detected from response timestamps:")
+            for i, poll in enumerate(day_polls, start=1):
+                marker = "  [proposed scored question]" if i == 1 else "  [attendance only]"
+                print(f"  {i}. {poll.path.name} ({_display_poll_time(poll.first_response_at)}){marker}")
+
+        if len(day_polls) > 1:
+            while True:
+                raw = input("\nUse question 1 as today's scored question? [Y/n]: ").strip().casefold()
+                if raw in {"", "y", "yes"}:
+                    break
+                if raw in {"n", "no"}:
+                    while True:
+                        choice_raw = input(f"Scored question [1-{len(day_polls)}]: ").strip()
+                        try:
+                            choice = int(choice_raw)
+                        except ValueError:
+                            choice = 0
+                        if 1 <= choice <= len(day_polls):
+                            selected = day_polls[choice - 1]
+                            break
+                        print(f"Please enter a number from 1 to {len(day_polls)}.")
+                    break
+                print("Please enter Y or N.")
+
+        prompt_correct_answer(selected)
+        attendance_only = [p for p in day_polls if p is not selected]
+        if attendance_only:
+            print("\nAttendance-only question(s):")
+            for poll in attendance_only:
+                print(f"  - {poll.question_name}")
+        else:
+            print("\nNo additional attendance-only questions for this date.")
 
 
 # ---------------------------------------------------------------------------
@@ -396,8 +622,9 @@ def prompt_correct_answer(poll: PollFile, index: int, total: int) -> None:
 # ---------------------------------------------------------------------------
 
 QUESTION_HEADERS = [
-    "Question ID", "Date", "Question", "Source File", "Options",
-    "Correct Answer", "Scored", "File Hash", "Imported At",
+    "Question ID", "Date", "Question", "Question Order", "Source Format",
+    "Source File", "First Response At", "Options", "Correct Answer", "Scored",
+    "File Hash", "Imported At",
 ]
 
 RESPONSE_HEADERS = [
@@ -668,7 +895,10 @@ def poll_to_records(
         "Question ID": poll.question_id,
         "Date": poll.class_date,
         "Question": poll.question_name,
+        "Question Order": str(poll.question_order),
+        "Source Format": poll.source_format,
         "Source File": poll.path.name,
+        "First Response At": poll.first_response_at,
         "Options": " | ".join(answer for answer, _ in poll.summary),
         "Correct Answer": correct_text,
         "Scored": "TRUE" if poll.scored else "FALSE",
@@ -713,7 +943,7 @@ def poll_to_records(
     unmatched = sum(1 for r in responses if not r.get("Student Key", ""))
 
     import_log = {
-        "Import ID": poll.file_hash[:12],
+        "Import ID": f"{poll.file_hash[:12]}::q{poll.question_order:02d}",
         "Date": poll.class_date,
         "Source File": poll.path.name,
         "File Hash": poll.file_hash,
@@ -770,9 +1000,14 @@ def build_derived_tables(
         q for q in questions
         if str(q.get("Scored", "")).strip().upper() == "TRUE"
     ]
-    scored_questions.sort(
-        key=lambda q: (q.get("Date", ""), q.get("Question ID", ""))
-    )
+    def _question_sort_key(q: Dict[str, str]):
+        try:
+            order = int(clean_space(q.get("Question Order", "")))
+        except ValueError:
+            order = 10**6
+        return (q.get("Date", ""), order, q.get("Question ID", ""))
+
+    scored_questions.sort(key=_question_sort_key)
 
     active_keys = set(students)
 
@@ -801,7 +1036,7 @@ def build_derived_tables(
 
     scores = [[
         "Student", *q_labels,
-        "Total Correct", "Questions Answered", "Accuracy",
+        "Total Correct", "Scored Questions Answered", "Accuracy",
     ]]
 
     leaderboard_data: List[Tuple[str, int, int, Optional[float]]] = []
@@ -841,7 +1076,7 @@ def build_derived_tables(
     )
 
     leaderboard = [[
-        "Rank", "Student", "Total Correct", "Questions Answered", "Accuracy",
+        "Rank", "Student", "Total Correct", "Scored Questions Answered", "Accuracy",
     ]]
     last_score: Optional[int] = None
     rank = 0
@@ -1511,15 +1746,26 @@ def sync_google_sheet(
         print("  The old Raw Responses tab was left untouched as a backup.")
 
     # Normalize any old v2 rows. If they are not mapped yet, resolve them now.
+    # Names that also occur in the incoming batch are deferred to the incoming
+    # matching pass so an unresolved participant is never prompted twice in
+    # the same run.
     existing_responses = [
         normalize_response_schema(r) for r in existing_responses
     ]
+    incoming_names_this_run = {
+        normalize_person_name(r.student_name)
+        for poll in polls
+        for r in effective_poll_responses(poll)
+        if clean_space(r.student_name)
+    }
     historical_unmapped_names = {
         r.get("Poll Participant", "")
         for r in existing_responses
         if not clean_space(r.get("Student Key", "")).startswith("canvas:")
         and clean_space(r.get("Poll Participant", ""))
         and clean_space(r.get("Match Status", "")) != "non-student"
+        and normalize_person_name(r.get("Poll Participant", ""))
+            not in incoming_names_this_run
     }
     if historical_unmapped_names:
         historical_mapping, participant_map_rows, _ = resolve_participants(
@@ -1557,7 +1803,12 @@ def sync_google_sheet(
 
     if exact_duplicates:
         print("\nExact duplicate file(s) already imported; skipped:")
+        seen_duplicate_files = set()
         for poll in exact_duplicates:
+            key = (str(poll.path), poll.file_hash)
+            if key in seen_duplicate_files:
+                continue
+            seen_duplicate_files.add(key)
             print(f"  - {poll.path.name}  [{poll.file_hash[:12]}]")
 
     if qid_conflicts and not replace:
@@ -1591,6 +1842,29 @@ def sync_google_sheet(
         print("\n--replace enabled; replacing:")
         for qid in sorted(replace_qids):
             print(f"  - {qid}")
+
+    # Guard the course rule across separate imports: if this class date already
+    # has a scored question in Google Sheets, any additional newly imported
+    # Polls for that date are attendance-only. A --replace of the scored
+    # question is handled above by removing the old question first.
+    existing_scored_by_date = {
+        clean_space(q.get("Date", "")): clean_space(q.get("Question ID", ""))
+        for q in existing_questions
+        if str(q.get("Scored", "")).strip().upper() == "TRUE"
+        and clean_space(q.get("Date", ""))
+    }
+    forced_attendance_only: List[PollFile] = []
+    for poll in candidates:
+        existing_scored_qid = existing_scored_by_date.get(poll.class_date)
+        if existing_scored_qid and poll.correct_answers is not None:
+            poll.correct_answers = None
+            forced_attendance_only.append(poll)
+
+    if forced_attendance_only:
+        print("\nExisting scored question already stored for this class date.")
+        print("These newly imported Polls will be attendance-only:")
+        for poll in forced_attendance_only:
+            print(f"  - {poll.path.name}")
 
     if not candidates:
         attendance, scores, leaderboard = build_derived_tables(
@@ -1693,8 +1967,11 @@ def sync_google_sheet(
         if not r.get("Student Key", "")
     }
 
+    imported_source_files = {str(p.path) for p in candidates}
+
     print(f"\nGoogle Sheet updated: {sh.title}")
-    print(f"Imported files: {len(candidates)}")
+    print(f"Imported source CSV files: {len(imported_source_files)}")
+    print(f"Imported questions: {len(candidates)}")
     print(f"Canonical questions: {len(all_questions)}")
     print(f"Canonical responses: {len(all_responses)}")
     print(f"Active students in roster: {len(active_keys)}")
@@ -1797,9 +2074,14 @@ def print_batch_summary(polls: Sequence[PollFile]) -> None:
     print("\n" + "=" * 72)
     print(f"ECS101 Poll Everywhere Importer v{VERSION}")
     print("=" * 72)
-    print(f"CSV files found: {len(polls)}")
+    source_files = {str(p.path) for p in polls}
+    lecture_files = {str(p.path) for p in polls if p.source_format == "lecture-wide"}
+    print(f"CSV files found: {len(source_files)}")
+    print(f"Questions detected: {len(polls)}")
+    if lecture_files:
+        print(f"Lecture-wide CSV files: {len(lecture_files)}")
     print(f"Class date(s): {', '.join(dates)}")
-    print(f"Unique Poll Everywhere participants: {len(all_students)}")
+    print(f"Unique Poll Everywhere participants with ≥1 answer: {len(all_students)}")
 
     unregistered = sorted({
         r.student_name
@@ -1858,14 +2140,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Import a Canvas roster and Poll Everywhere CSVs into normalized "
-            "Google Sheets tables, then rebuild attendance/scores/leaderboard."
+            "Google Sheets tables, then rebuild attendance/first-question "
+            "scores/leaderboard."
         )
     )
     parser.add_argument(
         "input",
         nargs="?",
         default=".",
-        help="Folder containing Poll Everywhere CSVs, or one Poll CSV file.",
+        help="Folder containing Poll Everywhere CSVs, or one Poll CSV file (lecture-wide or legacy).",
     )
     parser.add_argument(
         "--import-roster",
@@ -1890,7 +2173,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "--output-dir",
-        default="output_preview_v2_1",
+        default="output_preview_v2_3",
         help="Preview folder for --dry-run.",
     )
     parser.add_argument(
@@ -1965,7 +2248,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         csv_paths = discover_csvs(Path(args.input).expanduser().resolve())
-        polls = [parse_poll_everywhere_csv(p) for p in csv_paths]
+        polls = [
+            poll
+            for path in csv_paths
+            for poll in parse_poll_everywhere_export(path)
+        ]
     except Exception as exc:
         print(f"ERROR while reading Poll Everywhere CSV files: {exc}", file=sys.stderr)
         return 2
@@ -1976,8 +2263,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("WARNING: input files span multiple dates; each will be stored by its own date.")
 
     try:
-        for i, poll in enumerate(polls, start=1):
-            prompt_correct_answer(poll, i, len(polls))
+        configure_daily_scoring(polls)
     except (KeyboardInterrupt, EOFError):
         print("\nCancelled. No data were written.")
         return 130
@@ -2069,7 +2355,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("\n" + "=" * 72)
             print("Dry-run batch summary")
             print("=" * 72)
-            print(f"Questions: {len(polls)}")
+            print(f"Questions detected: {len(polls)}")
             print(f"Canonical responses: {len(preview_responses)}")
             print(
                 "Matched roster students represented: "
