@@ -341,3 +341,78 @@ def test_one_import_costs_a_handful_of_api_calls_not_forty():
 
     # v2.3.1 needed roughly 54 for the same work, against a 60/minute quota.
     assert calls["n"] <= 6, f"expected a handful of API calls, made {calls['n']}"
+
+
+# ---------------------------------------------------------------------------
+# A ragged matrix must be written as a full rectangle. values.update only
+# touches the cells it is given, so short rows used to leave the previous
+# import's text sitting to their right and empty rows were skipped entirely.
+# ---------------------------------------------------------------------------
+
+def _fake_sheet(recorder, rows=200, cols=12):
+    class FakeSheet:
+        title = "ECS101"
+
+        def fetch_sheet_metadata(self):
+            return {"sheets": [{"properties": {
+                "title": "Attendance Review", "sheetId": 1,
+                "gridProperties": {"rowCount": rows, "columnCount": cols},
+            }}]}
+
+        def batch_update(self, body):
+            return {}
+
+        def values_batch_update(self, body):
+            recorder["written"] = body["data"][0]["values"]
+            return {}
+
+        def values_batch_clear(self, params=None, body=None):
+            recorder["cleared"] = (params or {}).get("ranges", [])
+            return {}
+
+    return FakeSheet()
+
+
+def test_a_ragged_matrix_is_written_as_a_rectangle():
+    from ecs101.sheets import SheetIO
+
+    rec = {}
+    io = SheetIO(_fake_sheet(rec))
+    io.stage("Attendance Review", [
+        ["Date", "Roster", "Present", "Missing", "Unresolved", "Non-student"],
+        ["2026-08-26", "89", "82", "7", "4", "2"],
+        [],                                   # the blank separator row
+        ["Unmatched Poll Identities"],        # a one-cell section header
+        ["Date", "Poll Participant", "Status", "Notes"],
+    ])
+    io.commit()
+
+    written = rec["written"]
+    widths = {len(r) for r in written}
+    assert widths == {6}, f"rows must all be 6 wide, got {sorted(widths)}"
+    assert written[2] == [""] * 6, "the separator row must be written, not skipped"
+    assert written[3] == ["Unmatched Poll Identities", "", "", "", "", ""], (
+        "a short header row must blank the cells to its right"
+    )
+
+
+def test_columns_beyond_the_new_width_are_cleared():
+    """A shrinking table must not leave its old right-hand columns behind."""
+    from ecs101.sheets import SheetIO
+
+    rec = {}
+    io = SheetIO(_fake_sheet(rec, rows=200, cols=12))
+    io.stage("Attendance Review", [["a", "b"], ["c", "d"]])
+    io.commit()
+
+    cleared = rec["cleared"]
+    assert any("!C1:L" in r for r in cleared), f"columns C..L should be cleared, got {cleared}"
+    assert any("!A3:L200" in r for r in cleared), f"rows 3..200 should be cleared, got {cleared}"
+
+
+def test_column_letters():
+    from ecs101.sheets import _column_letter
+
+    assert [_column_letter(i) for i in (1, 2, 26, 27, 28, 52, 53)] == [
+        "A", "B", "Z", "AA", "AB", "AZ", "BA",
+    ]

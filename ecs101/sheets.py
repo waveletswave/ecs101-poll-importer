@@ -268,7 +268,20 @@ class SheetIO:
     # -- writing ----------------------------------------------------------
 
     def stage(self, title: str, matrix: Sequence[Sequence[str]]) -> None:
-        self._staged[title] = [[("" if c is None else str(c)) for c in row] for row in (matrix or [[""]])]
+        """Queue a tab's contents, padded to one rectangle.
+
+        Padding is not cosmetic. values.update only touches the cells it is
+        given, so a short row leaves whatever sat to its right untouched and an
+        empty row is skipped entirely. A ragged matrix therefore writes the new
+        content over the old one column by column and leaves stale text behind:
+        Attendance Review's section headers ended up sharing their rows with
+        leftovers from the previous import, and its blank separator rows never
+        appeared at all. Writing a full rectangle overwrites every cell in the
+        used range, which is what ws.clear() used to guarantee.
+        """
+        rows = [[("" if c is None else str(c)) for c in row] for row in (matrix or [[""]])]
+        width = max((len(r) for r in rows), default=1) or 1
+        self._staged[title] = [r + [""] * (width - len(r)) for r in rows]
 
     def backup(self, directory: Path, tabs: Sequence[str]) -> Optional[Path]:
         """Write the tabs as they were read to timestamped local CSVs.
@@ -362,14 +375,27 @@ class SheetIO:
         # RAW keeps a student named "+Ana" or an answer starting with "=" as
         # text rather than a formula. Do not switch this to USER_ENTERED.
 
+        # Anything outside the rectangle just written is left over from a
+        # previous, larger import: the rows below it and the columns to its
+        # right. Both are cleared, and only after the new values are in place.
         stale_ranges = []
         for title, matrix in self._staged.items():
             if title not in self._sheet_ids:
                 continue
-            have_rows, _ = self._grid.get(title, (0, 0))
-            first_stale = len(matrix) + 1
-            if have_rows >= first_stale:
-                stale_ranges.append(f"{_quote(title)}!A{first_stale}:ZZ{have_rows}")
+            have_rows, have_cols = self._grid.get(title, (0, 0))
+            width = max((len(r) for r in matrix), default=1) or 1
+            last_col = _column_letter(have_cols) if have_cols else "ZZ"
+
+            first_stale_row = len(matrix) + 1
+            if have_rows >= first_stale_row:
+                stale_ranges.append(
+                    f"{_quote(title)}!A{first_stale_row}:{last_col}{have_rows}"
+                )
+            if have_cols > width:
+                first_stale_col = _column_letter(width + 1)
+                stale_ranges.append(
+                    f"{_quote(title)}!{first_stale_col}1:{last_col}{max(have_rows, len(matrix))}"
+                )
         if stale_ranges:
             with_retry(self.sh.values_batch_clear, {"ranges": stale_ranges})
             calls += 1
@@ -382,6 +408,17 @@ class SheetIO:
 
 def _quote(title: str) -> str:
     return f"'{title}'" if any(c in title for c in " '!") else title
+
+
+def _column_letter(index: int) -> str:
+    """1 -> A, 26 -> Z, 27 -> AA. Used to bound the stale-cell clear ranges."""
+    if index < 1:
+        return "A"
+    letters = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
 
 
 def dicts_to_matrix(
