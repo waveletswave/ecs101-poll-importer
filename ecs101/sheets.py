@@ -185,13 +185,35 @@ def get_google_client(config: Dict[str, str]):
             "gspread is not installed. Run: python -m pip install -r requirements.txt"
         ) from exc
 
-    return gspread.oauth(
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-        credentials_filename=config.get("credentials_file", "credentials.json"),
-        authorized_user_filename=config.get(
-            "authorized_user_file", "authorized_user.json"
-        ),
-    )
+    token_file = config.get("authorized_user_file", "authorized_user.json")
+    try:
+        return gspread.oauth(
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+            credentials_filename=config.get("credentials_file", "credentials.json"),
+            authorized_user_filename=token_file,
+        )
+    except Exception as exc:
+        if not _is_expired_token(exc):
+            raise
+        raise RuntimeError(
+            "The saved Google authorization has expired or been revoked.\n"
+            f"Delete {token_file} and run the command again; a browser will "
+            "open to reauthorize.\n"
+            "\n"
+            "If this keeps happening every week: an OAuth consent screen set "
+            "to External with a publishing status of Testing issues refresh "
+            "tokens that expire after seven days. Publishing the app, or "
+            "switching it to Internal if the project sits in a Google "
+            "Workspace organization, removes that limit."
+        ) from exc
+
+
+def _is_expired_token(exc: BaseException) -> bool:
+    """Recognise google-auth's refresh failure without importing it eagerly."""
+    if exc.__class__.__name__ == "RefreshError":
+        return True
+    text = str(exc).casefold()
+    return "invalid_grant" in text or "token has been expired or revoked" in text
 
 
 def open_spreadsheet(config: Dict[str, str]):

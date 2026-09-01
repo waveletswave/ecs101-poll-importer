@@ -237,6 +237,28 @@ cp config.example.json config.json
 
 Unknown settings are rejected by name, so a typo says what is wrong instead of surfacing as an OAuth error.
 
+## When Google authorization expires
+
+`invalid_grant: Token has been expired or revoked` means the cached
+authorization is no longer valid. Delete the token file and run the command
+again; a browser opens to reauthorize:
+
+```bash
+rm authorized_user.json
+```
+
+If it recurs weekly, the cause is the OAuth consent screen. A project set to
+**External** with a publishing status of **Testing** issues refresh tokens that
+expire after seven days, unless the only scopes requested are name, e-mail and
+profile. This project requests the Sheets scope, so it is not exempt. Two ways
+to remove the limit, in Google Cloud Console under APIs & Services then OAuth
+consent screen:
+
+- **Publish app** moves the status to *In production*. Sign-in then shows an
+  "unverified app" warning that a handful of course staff can click past.
+- **Internal** user type removes both the limit and the warning, but is only
+  offered when the project sits inside a Google Workspace organization.
+
 ## Reliability
 
 Every import backs the canonical tabs up to `backups/<timestamp>/` before writing anything.

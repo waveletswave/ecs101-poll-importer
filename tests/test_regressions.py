@@ -416,3 +416,50 @@ def test_column_letters():
     assert [_column_letter(i) for i in (1, 2, 26, 27, 28, 52, 53)] == [
         "A", "B", "Z", "AA", "AB", "AZ", "BA",
     ]
+
+
+# ---------------------------------------------------------------------------
+# An expired Google authorization is a weekly event while the OAuth consent
+# screen sits in Testing, so it has to say what to do rather than surfacing
+# google-auth's raw invalid_grant text.
+# ---------------------------------------------------------------------------
+
+def test_an_expired_token_explains_how_to_recover(monkeypatch):
+    import sys
+    import types
+
+    import ecs101.sheets as sheets
+
+    class RefreshError(Exception):
+        pass
+
+    def boom(**kwargs):
+        raise RefreshError(
+            "('invalid_grant: Token has been expired or revoked.', "
+            "{'error': 'invalid_grant'})"
+        )
+
+    monkeypatch.setitem(sys.modules, "gspread", types.SimpleNamespace(oauth=boom))
+
+    with pytest.raises(RuntimeError) as caught:
+        sheets.get_google_client({"authorized_user_file": "authorized_user.json"})
+
+    message = str(caught.value)
+    assert "Delete authorized_user.json" in message
+    assert "seven days" in message
+    assert "invalid_grant" not in message   # the raw error is the cause, not the message
+
+
+def test_other_auth_failures_are_not_swallowed(monkeypatch):
+    import sys
+    import types
+
+    import ecs101.sheets as sheets
+
+    def boom(**kwargs):
+        raise FileNotFoundError("credentials.json")
+
+    monkeypatch.setitem(sys.modules, "gspread", types.SimpleNamespace(oauth=boom))
+
+    with pytest.raises(FileNotFoundError):
+        sheets.get_google_client({})
