@@ -350,10 +350,12 @@ def parse_excused_rows(
     for line_no, row in enumerate(rows, start=2):
         date = clean_space(row.get("Date"))
         raw_key = clean_space(row.get("Student Key"))
-        raw_name = clean_space(row.get("Student"))
+        raw_name = clean_space(row.get("Student Name") or row.get("Student"))
         reason = clean_space(row.get("Reason"))
         if not date and not raw_key and not raw_name:
             continue
+        if date.startswith("#"):
+            continue          # a comment or the seeded example
 
         where = f"Excused row {line_no}"
         if not date:

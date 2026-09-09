@@ -250,7 +250,7 @@ def build_attendance_review(
     matrix.append([heading])
     if not include_present_rows:
         matrix.append(["Present students are listed in the Attendance tab."])
-    matrix.append(["Date", "Student Key", "Student", "Status", "Notes"])
+    matrix.append(["Date", "Student Key", "Student Name", "Status", "Notes"])
 
     for date in dates:
         present_keys = present_by_date.get(date, set())

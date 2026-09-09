@@ -143,23 +143,27 @@ made directly on `Attendance` would be silently overwritten the next time the
 importer runs. The `Excused` tab exists so that does not happen: it is the one
 tab the importer reads but never writes.
 
-It is created with a header row the first time the importer runs, and from then
-on it belongs to the instructor. One row per excused absence:
+The first time the importer runs it creates the tab with a header row and a
+worked example, then leaves it alone. A row whose `Date` starts with `#` is a
+comment, so the example can stay there for reference without being reported
+every week:
 
 ```text
-Date         Student Key      Student            Reason
-2026-08-26   canvas:1487188   Imogen Vance       Varsity travel
-2026-09-02   canvas:1160917   Colin Cashman      Illness
+Date            Student Key      Student Name     Reason
+# 2026-09-02    canvas:1234567   Jane Doe         Varsity travel
+2026-08-26      canvas:1487188   Imogen Vance     Varsity travel
 ```
 
 `Date` must be a class date that already has imported questions. Fill in either
-`Student Key` or `Student`; giving both is safest, and the key wins if they
+`Student Key` or `Student Name`; giving both is safest, and the key wins if they
 disagree. `Attendance Review` lists the date, key and name of everyone with no
 matched response, which is the natural place to copy rows from. Any row the
 importer cannot resolve is reported by row number at import time rather than
 being quietly skipped.
 
-The entries show up after the next import, or immediately by running:
+Nothing recalculates on its own: Google Sheets stores the tab, the importer
+computes the views. New entries appear with the next lecture import, or
+straight away by running:
 
 ```bash
 python ecs101_poll_importer.py --refresh-views

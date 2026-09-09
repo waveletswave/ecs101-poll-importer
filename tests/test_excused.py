@@ -42,7 +42,7 @@ def _resp(date, qid, skey, name, correct="1"):
 
 def test_a_row_resolves_by_student_key():
     excused, problems = parse_excused_rows(
-        [{"Date": "2026-08-24", "Student Key": "canvas:2", "Student": "",
+        [{"Date": "2026-08-24", "Student Key": "canvas:2", "Student Name": "",
           "Reason": "Varsity travel"}],
         ROSTER, DATES,
     )
@@ -52,7 +52,7 @@ def test_a_row_resolves_by_student_key():
 
 def test_a_row_resolves_by_name_alone():
     excused, problems = parse_excused_rows(
-        [{"Date": "2026-08-26", "Student Key": "", "Student": "cleo  cardoso",
+        [{"Date": "2026-08-26", "Student Key": "", "Student Name": "cleo  cardoso",
           "Reason": "Illness"}],
         ROSTER, DATES,
     )
@@ -62,7 +62,7 @@ def test_a_row_resolves_by_name_alone():
 
 def test_blank_rows_are_ignored():
     excused, problems = parse_excused_rows(
-        [{"Date": "", "Student Key": "", "Student": "", "Reason": ""}],
+        [{"Date": "", "Student Key": "", "Student Name": "", "Reason": ""}],
         ROSTER, DATES,
     )
     assert excused == {} and problems == []
@@ -70,7 +70,7 @@ def test_blank_rows_are_ignored():
 
 def test_an_unknown_name_is_reported_not_dropped():
     _, problems = parse_excused_rows(
-        [{"Date": "2026-08-24", "Student Key": "", "Student": "Nobody Here",
+        [{"Date": "2026-08-24", "Student Key": "", "Student Name": "Nobody Here",
           "Reason": ""}],
         ROSTER, DATES,
     )
@@ -83,7 +83,7 @@ def test_an_ambiguous_name_asks_for_the_key():
         {"Student Key": "canvas:4", "Student Name": "Alina Ashworth", "Active": "TRUE"},
     ]
     _, problems = parse_excused_rows(
-        [{"Date": "2026-08-24", "Student Key": "", "Student": "Alina Ashworth",
+        [{"Date": "2026-08-24", "Student Key": "", "Student Name": "Alina Ashworth",
           "Reason": ""}],
         roster, DATES,
     )
@@ -93,7 +93,7 @@ def test_an_ambiguous_name_asks_for_the_key():
 
 def test_a_date_with_no_imported_questions_is_reported():
     _, problems = parse_excused_rows(
-        [{"Date": "2026-09-14", "Student Key": "canvas:1", "Student": "", "Reason": ""}],
+        [{"Date": "2026-09-14", "Student Key": "canvas:1", "Student Name": "", "Reason": ""}],
         ROSTER, DATES,
     )
     assert "not a class date" in problems[0]
@@ -101,7 +101,7 @@ def test_a_date_with_no_imported_questions_is_reported():
 
 def test_a_key_and_name_that_disagree_are_flagged_and_the_key_wins():
     excused, problems = parse_excused_rows(
-        [{"Date": "2026-08-24", "Student Key": "canvas:1", "Student": "Bruno Beck",
+        [{"Date": "2026-08-24", "Student Key": "canvas:1", "Student Name": "Bruno Beck",
           "Reason": "Conference"}],
         ROSTER, DATES,
     )
@@ -222,7 +222,7 @@ def _fake_sheet(existing, recorder):
     return FakeSheet()
 
 
-def test_the_tab_is_created_with_headers_on_first_run():
+def test_the_tab_is_created_with_headers_and_a_worked_example():
     from ecs101.models import EXCUSED_HEADERS
     from ecs101.sheets import SheetIO, WORKSHEET_TITLES
 
@@ -233,7 +233,39 @@ def test_the_tab_is_created_with_headers_on_first_run():
     io.commit()
 
     assert rec["created"] == ["Excused"]
-    assert rec["rows"]["Excused"][0][:len(EXCUSED_HEADERS)] == EXCUSED_HEADERS
+    seeded = rec["rows"]["Excused"]
+    assert seeded[0][:len(EXCUSED_HEADERS)] == EXCUSED_HEADERS
+    # An example the instructor can copy the shape from, in every column.
+    assert all(cell for cell in seeded[1][:4])
+    assert seeded[1][0].startswith("#")
+
+
+def test_the_seeded_example_never_becomes_a_warning():
+    """It sits in the tab for the whole semester, so it must stay silent."""
+    from ecs101.models import EXCUSED_SEED_ROWS, EXCUSED_HEADERS
+
+    rows = [dict(zip(EXCUSED_HEADERS, list(r) + [""] * 4)) for r in EXCUSED_SEED_ROWS]
+    excused, problems = parse_excused_rows(rows, ROSTER, DATES)
+    assert excused == {}
+    assert problems == []
+
+
+def test_removing_the_hash_activates_a_row():
+    from ecs101.models import EXCUSED_HEADERS
+
+    row = dict(zip(EXCUSED_HEADERS, ["2026-08-26", "canvas:2", "Bruno Beck", "Travel"]))
+    excused, problems = parse_excused_rows([row], ROSTER, DATES)
+    assert excused == {("canvas:2", "2026-08-26"): "Travel"}
+    assert problems == []
+
+
+def test_a_hand_written_comment_is_also_ignored():
+    excused, problems = parse_excused_rows(
+        [{"Date": "# waiting to hear back from the registrar", "Student Key": "",
+          "Student Name": "", "Reason": ""}],
+        ROSTER, DATES,
+    )
+    assert excused == {} and problems == []
 
 
 def test_an_existing_tab_is_never_written_to_again():
@@ -257,3 +289,29 @@ def test_the_tab_is_read_on_every_run():
     from ecs101.pipeline import _readable_titles
 
     assert "Excused" in _readable_titles()
+
+
+def test_the_name_column_is_called_student_name():
+    """Matches the Roster tab, so the three tabs line up column for column."""
+    from ecs101.models import EXCUSED_HEADERS
+
+    assert EXCUSED_HEADERS == ["Date", "Student Key", "Student Name", "Reason"]
+
+    review = build_attendance_review(QUESTIONS, [], ROSTER)
+    detail_header = next(
+        r for r in review if r[:2] == ["Date", "Student Key"]
+    )
+    assert detail_header[:3] == EXCUSED_HEADERS[:3], (
+        "the first three columns must match so rows can be pasted straight across"
+    )
+
+
+def test_a_tab_created_before_the_rename_still_works():
+    """Tolerate the old 'Student' header rather than silently ignoring the column."""
+    excused, problems = parse_excused_rows(
+        [{"Date": "2026-08-24", "Student Key": "", "Student": "Bruno Beck",
+          "Reason": "Illness"}],
+        ROSTER, DATES,
+    )
+    assert excused == {("canvas:2", "2026-08-24"): "Illness"}
+    assert problems == []

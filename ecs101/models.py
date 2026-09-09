@@ -27,7 +27,7 @@ __all__ = [
     "ROSTER_HEADERS",
     "PARTICIPANT_MAP_HEADERS",
     "EXCUSED_HEADERS",
-    "EXCUSED_INSTRUCTIONS",
+    "EXCUSED_SEED_ROWS",
     "LEGACY_RESPONSE_COLUMNS",
 ]
 
@@ -76,14 +76,16 @@ PARTICIPANT_MAP_HEADERS = [
 # excused absences here, one row per student per class date, and the importer
 # renders them into Attendance. Keeping the annotation in its own tab is what
 # makes it survive: every other tab is rebuilt from scratch on each import.
-EXCUSED_HEADERS = ["Date", "Student Key", "Student", "Reason"]
+EXCUSED_HEADERS = ["Date", "Student Key", "Student Name", "Reason"]
 
-EXCUSED_INSTRUCTIONS = (
-    "One row per excused absence. Date must match a class date (YYYY-MM-DD). "
-    "Fill in either Student Key or Student; both is safest. The importer reads "
-    "this tab and never writes to it, so nothing here is overwritten. Rows it "
-    "cannot match are reported at import time."
-)
+# Seeded once, when the tab is created. A row whose Date cell starts with # is
+# a comment, so the worked example can sit there being useful without being
+# reported as an unresolvable row on every run.
+EXCUSED_SEED_ROWS = [
+    ["# 2026-09-02", "canvas:1234567", "Jane Doe", "Varsity travel"],
+    ["# Example above. Remove the # to use a row. Copy Date, Student Key and "
+     "Student from the Attendance Review tab."],
+]
 
 
 # ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .models import (
     EXCUSED_HEADERS,
-    EXCUSED_INSTRUCTIONS,
+    EXCUSED_SEED_ROWS,
     IMPORT_LOG_HEADERS,
     PARTICIPANT_MAP_HEADERS,
     QUESTION_HEADERS,
@@ -62,7 +62,7 @@ WORKSHEET_TITLES = {
 READ_ONLY_TABS = ("excused",)
 
 _SEED_ON_CREATE = {
-    "Excused": [list(EXCUSED_HEADERS), [], [EXCUSED_INSTRUCTIONS]],
+    "Excused": [list(EXCUSED_HEADERS), *(list(r) for r in EXCUSED_SEED_ROWS)],
 }
 
 CANONICAL_TABS = ("roster", "participant_map", "questions", "responses", "import_log")
