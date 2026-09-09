@@ -13,6 +13,7 @@ from .models import (
 )
 from .normalize import (
     clean_space,
+    normalize_person_name,
     normalize_answer_text,
     normalize_email,
     poll_identity_key,
@@ -29,6 +30,7 @@ __all__ = [
     "roster_by_key",
     "active_roster_rows",
     "count_blank_active",
+    "parse_excused_rows",
 ]
 
 
@@ -309,3 +311,90 @@ def remap_existing_responses(
         remapped.append(row)
 
     return collapse_canonical_responses(remapped)
+
+
+# ---------------------------------------------------------------------------
+# Excused absences
+# ---------------------------------------------------------------------------
+
+def parse_excused_rows(
+    rows: Sequence[Dict[str, str]],
+    roster_rows: Sequence[Dict[str, str]],
+    class_dates: Sequence[str],
+) -> Tuple[Dict[Tuple[str, str], str], List[str]]:
+    """Resolve instructor-entered excused absences to (student key, date).
+
+    The instructor types these by hand, so every row is checked and anything
+    that cannot be resolved is reported rather than dropped in silence. A row
+    matches by Student Key when one is given, otherwise by a normalized name
+    that is unique in the roster.
+
+    Returns the resolved entries mapped to their reason, plus one message per
+    unusable row.
+    """
+    by_key: Dict[str, Dict[str, str]] = {}
+    by_name: Dict[str, object] = {}
+    for row in roster_rows:
+        key = clean_space(row.get("Student Key"))
+        if not key:
+            continue
+        by_key[key] = row
+        norm = normalize_person_name(row.get("Student Name"))
+        if norm:
+            by_name[norm] = None if norm in by_name else row
+
+    known_dates = {clean_space(d) for d in class_dates if clean_space(d)}
+    excused: Dict[Tuple[str, str], str] = {}
+    problems: List[str] = []
+
+    for line_no, row in enumerate(rows, start=2):
+        date = clean_space(row.get("Date"))
+        raw_key = clean_space(row.get("Student Key"))
+        raw_name = clean_space(row.get("Student"))
+        reason = clean_space(row.get("Reason"))
+        if not date and not raw_key and not raw_name:
+            continue
+
+        where = f"Excused row {line_no}"
+        if not date:
+            problems.append(f"{where}: no date")
+            continue
+        if known_dates and date not in known_dates:
+            problems.append(
+                f"{where}: {date!r} is not a class date with imported questions"
+            )
+            continue
+
+        student = None
+        if raw_key:
+            student = by_key.get(raw_key)
+            if student is None:
+                problems.append(f"{where}: no roster entry with Student Key {raw_key!r}")
+                continue
+        elif raw_name:
+            norm = normalize_person_name(raw_name)
+            hit = by_name.get(norm, "__missing__")
+            if hit == "__missing__":
+                problems.append(f"{where}: no roster entry named {raw_name!r}")
+                continue
+            if hit is None:
+                problems.append(
+                    f"{where}: {raw_name!r} matches more than one student; "
+                    "use the Student Key column instead"
+                )
+                continue
+            student = hit
+        else:
+            problems.append(f"{where}: neither Student Key nor Student was given")
+            continue
+
+        skey = clean_space(student.get("Student Key"))
+        name = clean_space(student.get("Student Name"))
+        if raw_key and raw_name and normalize_person_name(raw_name) != normalize_person_name(name):
+            problems.append(
+                f"{where}: Student Key {raw_key!r} is {name!r}, but the Student "
+                f"column says {raw_name!r}. Using the key."
+            )
+        excused[(skey, date)] = reason
+
+    return excused, problems

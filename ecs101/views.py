@@ -59,7 +59,16 @@ def build_derived_tables(
     questions: Sequence[Dict[str, str]],
     responses: Sequence[Dict[str, str]],
     roster_rows: Sequence[Dict[str, str]],
+    excused: Optional[Dict[Tuple[str, str], str]] = None,
 ) -> Tuple[List[List[str]], List[List[str]], List[List[str]]]:
+    """Rebuild Attendance, Scores and Leaderboard.
+
+    ``excused`` maps (student key, class date) to the instructor's reason. Those
+    dates show E rather than a blank, and are counted in their own column so the
+    plain attendance total stays a count of classes actually attended. Scores are
+    left alone: an excused student did not answer, and that is what Scores says.
+    """
+    excused = excused or {}
     students, display = roster_display_map(roster_rows)
 
     dates = sorted({clean_space(q.get("Date")) for q in questions if clean_space(q.get("Date"))})
@@ -77,13 +86,21 @@ def build_derived_tables(
         if clean_space(r.get("Student Key")) in active_keys and clean_space(r.get("Date"))
     }
 
-    attendance = [["Student", *dates, "Classes Attended"]]
+    attendance = [["Student", *dates, "Classes Attended", "Excused"]]
     for skey in students:
-        vals = ["P" if (skey, d) in attended else "" for d in dates]
+        vals = []
+        for d in dates:
+            if (skey, d) in attended:
+                vals.append("P")          # a matched response always wins
+            elif (skey, d) in excused:
+                vals.append("E")
+            else:
+                vals.append("")
         attendance.append([
             display.get(skey, skey),
             *vals,
             str(sum(v == "P" for v in vals)),
+            str(sum(v == "E" for v in vals)),
         ])
 
     latest = latest_canonical_responses(responses)
@@ -151,6 +168,7 @@ def build_attendance_review(
     responses: Sequence[Dict[str, str]],
     roster_rows: Sequence[Dict[str, str]],
     include_present_rows: bool = False,
+    excused: Optional[Dict[Tuple[str, str], str]] = None,
 ) -> List[List[str]]:
     """Build a review-oriented attendance sheet from canonical data.
 
@@ -165,6 +183,7 @@ def build_attendance_review(
     the end of a semester is a few thousand rows rewritten on every import for
     no added information: the present students are already in Attendance.
     """
+    excused = excused or {}
     active = active_roster_rows(roster_rows)
     active.sort(key=lambda r: r.get("Student Name", "").casefold())
     active_keys = {clean_space(r.get("Student Key")) for r in active}
@@ -204,15 +223,20 @@ def build_attendance_review(
 
     matrix.append(["Class Summary"])
     matrix.append([
-        "Date", "Active Canvas Roster", "Present",
+        "Date", "Active Canvas Roster", "Present", "Excused",
         "No matched Poll response", "Unresolved Poll participants",
         "Non-student participants",
     ])
     for date in dates:
-        present = len(present_by_date.get(date, set()))
-        missing = max(len(active) - present, 0)
+        present_keys = present_by_date.get(date, set())
+        present = len(present_keys)
+        excused_here = sum(
+            1 for skey in active_keys
+            if (skey, date) in excused and skey not in present_keys
+        )
+        missing = max(len(active) - present - excused_here, 0)
         matrix.append([
-            date, str(len(active)), str(present), str(missing),
+            date, str(len(active)), str(present), str(excused_here), str(missing),
             str(len(unresolved_by_date.get(date, set()))),
             str(len(nonstudent_by_date.get(date, set()))),
         ])
@@ -240,6 +264,11 @@ def build_attendance_review(
                 detail_rows.append((1, name.casefold(), [
                     date, skey, name, "Present",
                     "Matched response to at least one imported poll",
+                ]))
+            elif (skey, date) in excused:
+                detail_rows.append((1, name.casefold(), [
+                    date, skey, name, "Excused",
+                    excused[(skey, date)] or "Excused by the instructor",
                 ]))
             else:
                 detail_rows.append((0, name.casefold(), [

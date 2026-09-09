@@ -121,14 +121,56 @@ For ECS101 as configured (1:25 pm to 2:40 pm Eastern, exports in CDT), the one-h
 - **Responses** — one effective response per identity per question
 - **Import Log** — import history and duplicate protection
 
+### Instructor input
+
+- **Excused** — excused absences, entered by hand. The importer reads this tab
+  and never writes to it.
+
 ### Rebuilt views
 
-- **Attendance** — `P` if the student answered any question that day
+- **Attendance** — `P` if the student answered any question that day, `E` if
+  the Excused tab records an excused absence
 - **Attendance Review** — students with no matched Poll response, plus unresolved identities
 - **Scores** — first-question score for each class date
 - **Leaderboard** — cumulative correct answers, scored questions answered, and accuracy
 
 `Attendance Review` deliberately says **No matched Poll response** rather than **Absent**, because the Poll data alone cannot prove physical absence. It lists only the students who need a look; the present ones are already in `Attendance`.
+
+## Recording excused absences
+
+Every rebuilt view is regenerated from scratch on each import, so an annotation
+made directly on `Attendance` would be silently overwritten the next time the
+importer runs. The `Excused` tab exists so that does not happen: it is the one
+tab the importer reads but never writes.
+
+It is created with a header row the first time the importer runs, and from then
+on it belongs to the instructor. One row per excused absence:
+
+```text
+Date         Student Key      Student            Reason
+2026-08-26   canvas:1487188   Imogen Vance       Varsity travel
+2026-09-02   canvas:1160917   Colin Cashman      Illness
+```
+
+`Date` must be a class date that already has imported questions. Fill in either
+`Student Key` or `Student`; giving both is safest, and the key wins if they
+disagree. `Attendance Review` lists the date, key and name of everyone with no
+matched response, which is the natural place to copy rows from. Any row the
+importer cannot resolve is reported by row number at import time rather than
+being quietly skipped.
+
+The entries show up after the next import, or immediately by running:
+
+```bash
+python ecs101_poll_importer.py --refresh-views
+```
+
+In `Attendance`, an excused date shows `E`. `Classes Attended` stays a count of
+classes actually attended and a separate `Excused` column counts the rest, so
+how the two are weighted at the end of the semester remains a course decision.
+A matched response always wins over an excused row: if the student answered,
+they were there. `Scores` is deliberately unaffected, since an excused student
+did not answer the scored question.
 
 ## Useful commands
 

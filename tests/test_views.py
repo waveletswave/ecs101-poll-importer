@@ -38,9 +38,11 @@ def test_attendance_marks_any_answered_question():
         _resp("2026-08-26", "2026-08-26::Q1", "canvas:2", "1", "Bruno Beck"),
     ]
     attendance, _, _ = build_derived_tables(QUESTIONS, responses, ROSTER)
-    assert attendance[0] == ["Student", "2026-08-24", "2026-08-26", "Classes Attended"]
-    assert attendance[1] == ["Alina Ashworth", "P", "", "1"]
-    assert attendance[2] == ["Bruno Beck", "", "P", "1"]
+    assert attendance[0] == [
+        "Student", "2026-08-24", "2026-08-26", "Classes Attended", "Excused",
+    ]
+    assert attendance[1] == ["Alina Ashworth", "P", "", "1", "0"]
+    assert attendance[2] == ["Bruno Beck", "", "P", "1", "0"]
 
 
 def test_inactive_students_are_excluded_from_every_view():
@@ -155,7 +157,8 @@ def test_review_summary_counts_are_right():
     assert row[0] == "2026-08-24"
     assert row[1] == "2"    # active roster
     assert row[2] == "1"    # present
-    assert row[3] == "1"    # no matched response
+    assert row[3] == "0"    # excused
+    assert row[4] == "1"    # no matched response
 
 
 def test_old_v2_response_rows_still_read():

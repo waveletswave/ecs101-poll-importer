@@ -90,8 +90,8 @@ def test_retroactive_identification_backfills_history():
     responses = collapse_canonical_responses([*backfilled, *week2])
     attendance, scores, _ = build_derived_tables(questions, responses, roster)
 
-    # ['Alina Ashworth', '2026-08-24', '2026-08-26', 'Classes Attended']
-    assert attendance[1] == ["Alina Ashworth", "P", "P", "2"]
+    # ['Alina Ashworth', '2026-08-24', '2026-08-26', 'Classes Attended', 'Excused']
+    assert attendance[1] == ["Alina Ashworth", "P", "P", "2", "0"]
     # Both scored questions answered correctly.
     assert scores[1][1:3] == ["1", "1"]
     assert scores[1][3] == "2"

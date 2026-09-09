@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .models import (
+    EXCUSED_HEADERS,
+    EXCUSED_INSTRUCTIONS,
     IMPORT_LOG_HEADERS,
     PARTICIPANT_MAP_HEADERS,
     QUESTION_HEADERS,
@@ -51,6 +53,16 @@ WORKSHEET_TITLES = {
     "attendance_review": "Attendance Review",
     "scores": "Scores",
     "leaderboard": "Leaderboard",
+    "excused": "Excused",
+}
+
+# Excused is the instructor's tab. The importer reads it and creates it once
+# with a header row, but never stages it for writing again, so nothing entered
+# there can be overwritten by a later import.
+READ_ONLY_TABS = ("excused",)
+
+_SEED_ON_CREATE = {
+    "Excused": [list(EXCUSED_HEADERS), [], [EXCUSED_INSTRUCTIONS]],
 }
 
 CANONICAL_TABS = ("roster", "participant_map", "questions", "responses", "import_log")
@@ -232,6 +244,9 @@ class SheetIO:
             self._sheet_ids[title] = ws.id
             self._grid[title] = (200, 26)
             self._new_titles.append(title)
+            seed = _SEED_ON_CREATE.get(title)
+            if seed is not None:
+                self.stage(title, seed)
 
     def read_all(self, titles: Sequence[str]) -> Dict[str, List[List[str]]]:
         """Fetch several tabs in a single values.batchGet call."""

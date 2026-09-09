@@ -21,6 +21,7 @@ from .normalize import clean_space, now_iso, short_hash
 from .parsers import parse_canvas_roster
 from .records import (
     active_roster_rows,
+    parse_excused_rows,
     build_updated_roster,
     collapse_canonical_responses,
     count_blank_active,
@@ -30,6 +31,7 @@ from .records import (
 )
 from .sheets import (
     CANONICAL_TABS,
+    READ_ONLY_TABS,
     WORKSHEET_TITLES,
     SheetIO,
     dicts_to_matrix,
@@ -65,11 +67,15 @@ def _canonical_titles() -> List[str]:
     return [_title(k) for k in CANONICAL_TABS]
 
 
+def _readable_titles() -> List[str]:
+    return _canonical_titles() + [_title(k) for k in READ_ONLY_TABS]
+
+
 def _open(config: Dict[str, str]) -> Tuple[object, SheetIO]:
     sh = open_spreadsheet(config)
     io = SheetIO(sh)
     io.ensure_worksheets()
-    io.read_all(_canonical_titles())
+    io.read_all(_readable_titles())
     return sh, io
 
 
@@ -98,9 +104,29 @@ def _stage_views(
     questions: Sequence[Dict[str, str]],
     responses: Sequence[Dict[str, str]],
     roster_rows: Sequence[Dict[str, str]],
+    output_fn=print,
 ) -> None:
-    attendance, scores, leaderboard = build_derived_tables(questions, responses, roster_rows)
-    review = build_attendance_review(questions, responses, roster_rows)
+    class_dates = sorted({
+        clean_space(q.get("Date")) for q in questions if clean_space(q.get("Date"))
+    })
+    excused, problems = parse_excused_rows(
+        io.records(_title("excused")), roster_rows, class_dates
+    )
+    if excused:
+        output_fn(f"\nExcused absences read from the Excused tab: {len(excused)}")
+    if problems:
+        output_fn(f"{len(problems)} Excused row(s) could not be used:")
+        for problem in problems[:15]:
+            output_fn(f"  - {problem}")
+        if len(problems) > 15:
+            output_fn(f"  ... and {len(problems) - 15} more")
+
+    attendance, scores, leaderboard = build_derived_tables(
+        questions, responses, roster_rows, excused
+    )
+    review = build_attendance_review(
+        questions, responses, roster_rows, excused=excused
+    )
     io.stage(_title("attendance"), attendance)
     io.stage(_title("attendance_review"), review)
     io.stage(_title("scores"), scores)
