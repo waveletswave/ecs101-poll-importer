@@ -7,6 +7,8 @@ truth in its own tab is what makes the annotation durable.
 
 from __future__ import annotations
 
+import pytest
+
 from ecs101.records import parse_excused_rows
 from ecs101.views import build_attendance_review, build_derived_tables
 
@@ -41,7 +43,7 @@ def _resp(date, qid, skey, name, correct="1"):
 # ---------------------------------------------------------------------------
 
 def test_a_row_resolves_by_student_key():
-    excused, problems = parse_excused_rows(
+    excused, problems, _ = parse_excused_rows(
         [{"Date": "2026-08-24", "Student Key": "canvas:2", "Student Name": "",
           "Reason": "Varsity travel"}],
         ROSTER, DATES,
@@ -51,7 +53,7 @@ def test_a_row_resolves_by_student_key():
 
 
 def test_a_row_resolves_by_name_alone():
-    excused, problems = parse_excused_rows(
+    excused, problems, _ = parse_excused_rows(
         [{"Date": "2026-08-26", "Student Key": "", "Student Name": "cleo  cardoso",
           "Reason": "Illness"}],
         ROSTER, DATES,
@@ -61,7 +63,7 @@ def test_a_row_resolves_by_name_alone():
 
 
 def test_blank_rows_are_ignored():
-    excused, problems = parse_excused_rows(
+    excused, problems, _ = parse_excused_rows(
         [{"Date": "", "Student Key": "", "Student Name": "", "Reason": ""}],
         ROSTER, DATES,
     )
@@ -69,7 +71,7 @@ def test_blank_rows_are_ignored():
 
 
 def test_an_unknown_name_is_reported_not_dropped():
-    _, problems = parse_excused_rows(
+    _, problems, _ = parse_excused_rows(
         [{"Date": "2026-08-24", "Student Key": "", "Student Name": "Nobody Here",
           "Reason": ""}],
         ROSTER, DATES,
@@ -82,7 +84,7 @@ def test_an_ambiguous_name_asks_for_the_key():
     roster = ROSTER + [
         {"Student Key": "canvas:4", "Student Name": "Alina Ashworth", "Active": "TRUE"},
     ]
-    _, problems = parse_excused_rows(
+    _, problems, _ = parse_excused_rows(
         [{"Date": "2026-08-24", "Student Key": "", "Student Name": "Alina Ashworth",
           "Reason": ""}],
         roster, DATES,
@@ -91,16 +93,94 @@ def test_an_ambiguous_name_asks_for_the_key():
     assert "Student Key" in problems[0]
 
 
-def test_a_date_with_no_imported_questions_is_reported():
-    _, problems = parse_excused_rows(
+def test_a_past_day_without_class_is_reported_with_the_nearest_class_dates():
+    _, problems, waiting = parse_excused_rows(
+        [{"Date": "2026-08-25", "Student Key": "canvas:1", "Student Name": "", "Reason": ""}],
+        ROSTER, DATES,
+    )
+    assert "2026-08-25 is not a class date" in problems[0]
+    assert "2026-08-24, 2026-08-26" in problems[0]
+    assert waiting == 0
+
+
+def test_a_day_after_the_last_imported_class_waits_quietly():
+    """Entered ahead of time, which is normal for a travel letter."""
+    excused, problems, waiting = parse_excused_rows(
         [{"Date": "2026-09-14", "Student Key": "canvas:1", "Student Name": "", "Reason": ""}],
         ROSTER, DATES,
     )
-    assert "not a class date" in problems[0]
+    assert (excused, problems, waiting) == ({}, [], 1)
+
+
+# ---------------------------------------------------------------------------
+# Spans of days. Athletes' accommodations usually cover several classes, and
+# every class inside the span counts as excused.
+# ---------------------------------------------------------------------------
+
+TERM = ["2026-08-24", "2026-08-26", "2026-08-31", "2026-09-02", "2026-09-09"]
+
+
+def _span(first, last, key="canvas:2"):
+    return {"Date": first, "End Date": last, "Student Key": key, "Student Name": "",
+            "Reason": "Athletics"}
+
+
+def test_a_span_excuses_every_class_inside_it_and_nothing_outside():
+    excused, problems, _ = parse_excused_rows([_span("2026-08-25", "2026-09-01")], ROSTER, TERM)
+    assert sorted(excused) == [("canvas:2", "2026-08-26"), ("canvas:2", "2026-08-31")]
+    assert problems == []
+
+
+def test_a_span_includes_both_of_its_end_days():
+    excused, _, _ = parse_excused_rows([_span("2026-08-26", "2026-09-02")], ROSTER, TERM)
+    assert sorted(d for _, d in excused) == ["2026-08-26", "2026-08-31", "2026-09-02"]
+
+
+def test_a_span_picks_up_classes_imported_later():
+    row = [_span("2026-08-31", "2026-09-09")]
+    before, problems, waiting = parse_excused_rows(row, ROSTER, TERM[:3])
+    after, _, _ = parse_excused_rows(row, ROSTER, TERM)
+    assert sorted(d for _, d in before) == ["2026-08-31"] and problems == [] and waiting == 0
+    assert sorted(d for _, d in after) == ["2026-08-31", "2026-09-02", "2026-09-09"]
+
+
+def test_a_span_entirely_after_the_last_import_waits_quietly():
+    excused, problems, waiting = parse_excused_rows(
+        [_span("2026-10-14", "2026-10-19")], ROSTER, TERM
+    )
+    assert (excused, problems, waiting) == ({}, [], 1)
+
+
+def test_a_span_with_no_class_inside_it_is_reported():
+    _, problems, _ = parse_excused_rows([_span("2026-09-03", "2026-09-08")], ROSTER, TERM)
+    assert "no class date between 2026-09-03 and 2026-09-08" in problems[0]
+
+
+def test_an_end_date_before_the_date_is_reported():
+    _, problems, _ = parse_excused_rows([_span("2026-09-02", "2026-08-26")], ROSTER, TERM)
+    assert "before Date" in problems[0]
+
+
+@pytest.mark.parametrize("typed", ["2026-8-26", "2026/08/26", "8/26/2026", "8/26/26", "Aug 26, 2026"])
+def test_dates_are_read_in_the_forms_people_type(typed):
+    excused, problems, _ = parse_excused_rows(
+        [{"Date": typed, "Student Key": "canvas:3", "Student Name": "", "Reason": "Illness"}],
+        ROSTER, DATES,
+    )
+    assert excused == {("canvas:3", "2026-08-26"): "Illness"}
+    assert problems == []
+
+
+def test_an_unreadable_date_is_reported():
+    _, problems, _ = parse_excused_rows(
+        [{"Date": "next Tuesday", "Student Key": "canvas:3", "Student Name": "", "Reason": ""}],
+        ROSTER, DATES,
+    )
+    assert "cannot read 'next Tuesday' as a date" in problems[0]
 
 
 def test_a_key_and_name_that_disagree_are_flagged_and_the_key_wins():
-    excused, problems = parse_excused_rows(
+    excused, problems, _ = parse_excused_rows(
         [{"Date": "2026-08-24", "Student Key": "canvas:1", "Student Name": "Bruno Beck",
           "Reason": "Conference"}],
         ROSTER, DATES,
@@ -238,6 +318,8 @@ def test_the_tab_is_created_with_headers_and_a_worked_example():
     # An example the instructor can copy the shape from, in every column.
     assert all(cell for cell in seeded[1][:4])
     assert seeded[1][0].startswith("#")
+    # And one for a span of days, with its End Date filled.
+    assert seeded[2][0].startswith("#") and seeded[2][4]
 
 
 def test_the_seeded_example_never_becomes_a_warning():
@@ -245,22 +327,23 @@ def test_the_seeded_example_never_becomes_a_warning():
     from ecs101.models import EXCUSED_SEED_ROWS, EXCUSED_HEADERS
 
     rows = [dict(zip(EXCUSED_HEADERS, list(r) + [""] * 4)) for r in EXCUSED_SEED_ROWS]
-    excused, problems = parse_excused_rows(rows, ROSTER, DATES)
+    excused, problems, waiting = parse_excused_rows(rows, ROSTER, DATES)
     assert excused == {}
     assert problems == []
+    assert waiting == 0
 
 
 def test_removing_the_hash_activates_a_row():
     from ecs101.models import EXCUSED_HEADERS
 
     row = dict(zip(EXCUSED_HEADERS, ["2026-08-26", "canvas:2", "Bruno Beck", "Travel"]))
-    excused, problems = parse_excused_rows([row], ROSTER, DATES)
+    excused, problems, _ = parse_excused_rows([row], ROSTER, DATES)
     assert excused == {("canvas:2", "2026-08-26"): "Travel"}
     assert problems == []
 
 
 def test_a_hand_written_comment_is_also_ignored():
-    excused, problems = parse_excused_rows(
+    excused, problems, _ = parse_excused_rows(
         [{"Date": "# waiting to hear back from the registrar", "Student Key": "",
           "Student Name": "", "Reason": ""}],
         ROSTER, DATES,
@@ -295,7 +378,7 @@ def test_the_name_column_is_called_student_name():
     """Matches the Roster tab, so the three tabs line up column for column."""
     from ecs101.models import EXCUSED_HEADERS
 
-    assert EXCUSED_HEADERS == ["Date", "Student Key", "Student Name", "Reason"]
+    assert EXCUSED_HEADERS == ["Date", "Student Key", "Student Name", "Reason", "End Date"]
 
     review = build_attendance_review(QUESTIONS, [], ROSTER)
     detail_header = next(
@@ -308,7 +391,7 @@ def test_the_name_column_is_called_student_name():
 
 def test_a_tab_created_before_the_rename_still_works():
     """Tolerate the old 'Student' header rather than silently ignoring the column."""
-    excused, problems = parse_excused_rows(
+    excused, problems, _ = parse_excused_rows(
         [{"Date": "2026-08-24", "Student Key": "", "Student": "Bruno Beck",
           "Reason": "Illness"}],
         ROSTER, DATES,

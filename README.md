@@ -2,7 +2,7 @@
 
 A Python tool for maintaining the ECS101 **attendance, daily trivia score, and leaderboard** in a shared Google Sheet.
 
-**Current version: v3.2.0**
+**Current version: v3.3.0**
 
 ## Course rules
 
@@ -58,16 +58,32 @@ python ecs101_poll_importer.py polls/2026-08-26/Lecture2_Kamchatka.csv
 
 The importer will:
 
-1. detect the questions in their exported order;
+1. detect the questions in their exported order, keeping apart questions that share a title as "... (2)", "... (3)";
 2. check the response times against the scheduled class window;
-3. propose question 1 as the scored question;
-4. ask the TA to confirm it;
-5. ask for the correct answer to question 1, and refuse an answer that matches no student response;
-6. treat all later questions as attendance-only;
-7. match participants to the Canvas roster, prompting only for identities it cannot resolve; and
-8. update the shared Google Sheet in one batched write.
+3. ask about anyone who started the poll on another day (see below);
+4. propose question 1 as the scored question;
+5. ask the TA to confirm it;
+6. ask for the correct answer to question 1, and refuse an answer that matches no student response;
+7. treat all later questions as attendance-only;
+8. match participants to the Canvas roster, prompting only for identities it cannot resolve; and
+9. update the shared Google Sheet in one batched write.
 
 Pointing the importer at a folder, or at nothing to use the current folder, imports every Poll export beneath it. It reads the sheet's `Import Log` before asking anything: exports already imported are listed and skipped without a question, and a run with nothing new stops without writing. The backup folder and dry-run previews (`*_preview.csv`) are never scanned.
+
+### Participants who started on another day
+
+Each row of a lecture export is stamped with the time of its first answer. If one of a lecture's questions is opened during an earlier class, the answers given then start a row dated that earlier day. The importer files an export under the date most rows share. Participants who also have a row started on the class date already count and are only mentioned. For the rest, every answer carries the earlier date, including any given in class on the class date, and a row cannot be split by day, so the importer lists them before importing:
+
+```text
+Lecture9.csv: 3 participant(s) started on another day
+Already counted on 2026-09-23 through a row started that day: Rafferty Quill
+  1. Linnea Stroud    started 9/21 1:52 PM  answered Q2 Q3
+     Q3: nobody else who started on 9/21 answered this
+  2. Odile Fairbanks  started 9/21 1:47 PM  answered Q2
+Count which of them as present on 2026-09-23? [numbers such as 2 or 1,3; Enter for none]:
+```
+
+A question nobody else answered on the earlier day was most likely answered on the class date, which is what the note points out. The decision stays with the TA, and Enter counts nobody. Answers that are counted keep their real start time.
 
 ## Participant identity matching
 
@@ -147,23 +163,32 @@ made directly on `Attendance` would be silently overwritten the next time the
 importer runs. The `Excused` tab exists so that does not happen: it is the one
 tab the importer reads but never writes.
 
-The first time the importer runs it creates the tab with a header row and a
-worked example, then leaves it alone. A row whose `Date` starts with `#` is a
-comment, so the example can stay there for reference without being reported
+The first time the importer runs it creates the tab with a header row and two
+worked examples, then leaves it alone. A row whose `Date` starts with `#` is a
+comment, so the examples can stay there for reference without being reported
 every week:
 
 ```text
-Date            Student Key      Student Name     Reason
-# 2026-09-02    canvas:1234567   Jane Doe         Varsity travel
-2026-08-26      canvas:1487188   Imogen Vance     Varsity travel
+Date            Student Key      Student Name     Reason          End Date
+# 2026-09-02    canvas:1234567   Jane Doe         Dean's note
+# 2026-10-14    canvas:1234567   Jane Doe         Athletics       2026-10-19
+2026-08-26      canvas:7654321   Imogen Vance     Varsity travel
 ```
 
-`Date` must be a class date that already has imported questions. Fill in either
-`Student Key` or `Student Name`; giving both is safest, and the key wins if they
-disagree. `Attendance Review` lists the date, key and name of everyone with no
-matched response, which is the natural place to copy rows from. Any row the
-importer cannot resolve is reported by row number at import time rather than
-being quietly skipped.
+A row with only `Date` excuses that class. A row with an `End Date` excuses
+every class from `Date` through `End Date`, including classes imported later,
+which suits athletes' accommodations that span several meetings. Dates may be
+typed as `2026-11-02`, `2026-11-2` or `11/2/2026`. A tab created before v3.3.0
+needs `End Date` typed once into the first empty header cell.
+
+`End Date` sits in the last column so that the first three columns line up
+with `Attendance Review`, which lists the date, key and name of everyone with
+no matched response: rows can be copied straight across from there. Fill in
+either `Student Key` or `Student Name`; giving both is safest, and the key wins
+if they disagree. A row whose days all fall after the last imported class
+waits quietly and is only counted. Any other row the importer cannot resolve,
+such as a date that is not a class day, is reported by row number at import
+time rather than being quietly skipped.
 
 Nothing recalculates on its own: Google Sheets stores the tab, the importer
 computes the views. New entries appear with the next lecture import, or
@@ -287,7 +312,7 @@ ecs101/
     identity.py            participant matching and interactive review
     records.py             canonical record building, collapse, remap
     views.py               Attendance, Scores, Leaderboard, Attendance Review
-    scoring.py             scored-question selection and the correct-answer guard
+    scoring.py             daily setup: off-day participants, the scored question, the correct-answer guard
     sheets.py              the only module that imports gspread
     pipeline.py            orchestration
     cli.py                 argparse and dispatch

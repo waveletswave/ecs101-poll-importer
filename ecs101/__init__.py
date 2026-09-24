@@ -26,6 +26,6 @@ Module layout. Only ``sheets`` and ``pipeline`` touch Google; everything else
 is pure data in, data out, which is what makes the test suite possible.
 """
 
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 
 __all__ = ["VERSION"]

@@ -236,3 +236,81 @@ def test_an_expired_token_is_reported_before_any_scoring_question(
     assert cli.main([str(tmp_path / "polls"), "--config", str(settings)]) == 3
     assert asked == []
     assert "expired" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# A span of days in the Excused tab covers every class inside it, including
+# lectures imported after the row was written.
+# ---------------------------------------------------------------------------
+
+def test_an_excused_span_covers_lectures_imported_after_it_was_entered(
+    tmp_path, sheet, config, scripted, silent
+):
+    pipeline.sync_canvas_roster(
+        canvas(tmp_path, "roster.csv", ROWAN, NOOR), config,
+        input_fn=scripted(), output_fn=silent,
+    )
+    # The instructor enters a travel letter before the trip. End Date comes
+    # last so that the first three columns still paste from Attendance Review.
+    sheet.tabs["Excused"] = [
+        ["Date", "Student Key", "Student Name", "Reason", "End Date"],
+        ["2026-09-01", "canvas:100003", "Noor Haddad", "Athletics", "2026-9-10"],
+    ]
+
+    printed: List[str] = []
+    pipeline.import_polls(
+        parsed(lecture(tmp_path, "Lecture4.csv", "09/02/26", ROWAN)), config,
+        input_fn=scripted(), output_fn=printed.append,
+    )
+    assert "Excused absences read from the Excused tab: 1" in "\n".join(printed)
+
+    pipeline.import_polls(
+        parsed(lecture(tmp_path, "Lecture5.csv", "09/09/26", ROWAN),
+               lecture(tmp_path, "Lecture6.csv", "09/14/26", ROWAN)), config,
+        input_fn=scripted(), output_fn=silent,
+    )
+    row = attendance_of(sheet, "Noor Haddad")
+    assert [row["2026-09-02"], row["2026-09-09"], row["2026-09-14"]] == ["E", "E", ""]
+    assert (row["Classes Attended"], row["Excused"]) == ("0", "2")
+
+
+# ---------------------------------------------------------------------------
+# A participant who started on another day counts on the class date when the
+# TA says so, and only then.
+# ---------------------------------------------------------------------------
+
+def test_a_participant_who_started_early_counts_once_the_ta_says_so(
+    tmp_path, sheet, config, scripted, silent
+):
+    early = ("Linnea", "Stroud", '"Stroud, Linnea",100011,9000011,ls402,ECS101-01,9\n')
+    idle = ("Odile", "Fairbanks", '"Fairbanks, Odile",100012,9000012,of77,ECS101-01,9\n')
+    petra = ("Petra", "Solano", '"Solano, Petra",100004,9000004,petras,ECS101-01,7\n')
+    pipeline.sync_canvas_roster(
+        canvas(tmp_path, "roster.csv", ROWAN, NOOR, petra, early, idle), config,
+        input_fn=scripted(), output_fn=silent,
+    )
+    path = tmp_path / "Lecture9.csv"
+    path.write_text(
+        "Response #,Started At (CDT),Participant First Name,Participant Last Name,"
+        "Email,Screen Name,Public ID,Where is this photo taken?,Which rock weathers slowest?,"
+        "Which rock is your favorite?\n"
+        "1,9/21/26 12:47 PM,Odile,Fairbanks,odile.fairbanks@example.edu,Odile F,11,,Quartzite,\n"
+        "2,9/21/26 12:52 PM,Linnea,Stroud,linnea.stroud@example.edu,Linnea S,13,,Shale,Granite\n"
+        "3,9/23/26 12:30 PM,Rowan,Fletcher,rowan.fletcher@example.edu,Rowan F,14,Maine,Quartzite,Basalt\n"
+        "4,9/23/26 12:31 PM,Noor,Haddad,noor.haddad@example.edu,Noor H.,15,Maine,Shale,Granite\n"
+        "5,9/23/26 12:32 PM,Petra,Solano,petra.solano@example.edu,Petra S.,16,Maine,Shale,\n",
+        encoding="utf-8",
+    )
+    polls = parsed(path)
+
+    from ecs101.scoring import review_off_date_participants
+
+    def configure(chosen):
+        review_off_date_participants(chosen, input_fn=scripted("1"), output_fn=silent)
+
+    pipeline.import_polls(polls, config, configure=configure,
+                          input_fn=scripted(), output_fn=silent)
+
+    assert attendance_of(sheet, "Linnea Stroud")["2026-09-23"] == "P"
+    assert attendance_of(sheet, "Odile Fairbanks")["2026-09-23"] == ""
+    assert attendance_of(sheet, "Rowan Fletcher")["2026-09-23"] == "P"

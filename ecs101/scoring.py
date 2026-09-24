@@ -1,10 +1,17 @@
-"""Interactive setup of the one scored question per class date."""
+"""Interactive setup before an import.
+
+Two decisions are the TA's: which participants who started a lecture's poll on
+another day count on its class date, and the one scored question per date.
+"""
 
 from __future__ import annotations
 
+import re
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set
 
-from .models import PollFile, effective_poll_responses
+from .models import OffDateParticipant, PollFile, effective_poll_responses
 from .normalize import clean_space, normalize_answer_text
 
 __all__ = [
@@ -12,6 +19,8 @@ __all__ = [
     "configure_daily_scoring",
     "day_poll_order",
     "count_answer_hits",
+    "review_off_date_participants",
+    "admit_off_date_participants",
 ]
 
 
@@ -210,3 +219,147 @@ def configure_daily_scoring(
                 output_fn(f"  - {poll.question_name}")
         else:
             output_fn("\nNo additional attendance-only questions for this date.")
+
+
+# ---------------------------------------------------------------------------
+# Participants who started on another day
+# ---------------------------------------------------------------------------
+
+def _month_day(iso_date: str) -> str:
+    try:
+        d = datetime.fromisoformat(iso_date)
+    except ValueError:
+        return iso_date
+    return f"{d.month}/{d.day}"
+
+
+def _clock(iso: str) -> str:
+    """'2026-09-21T13:52:00-04:00' -> '9/21 1:52 PM'."""
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return iso
+    return f"{dt.month}/{dt.day} {dt.strftime('%I:%M %p').lstrip('0')}"
+
+
+def admit_off_date_participants(
+    polls: Sequence[PollFile],
+    chosen: Sequence[OffDateParticipant],
+) -> None:
+    """File the chosen participants' answers under their export's class date.
+
+    ``polls`` are the questions of one export. Each answer keeps the
+    participant's real start time as its timestamp; only the date it counts
+    toward changes.
+    """
+    by_order = {p.question_order: p for p in polls}
+    for person in chosen:
+        for order, response in person.responses.items():
+            poll = by_order.get(order)
+            if poll is not None:
+                poll.responses.append(response)
+    for poll in polls:
+        poll.summary = poll.answer_counts()
+
+
+def review_off_date_participants(
+    polls: Sequence[PollFile],
+    input_fn=input,
+    output_fn=print,
+) -> None:
+    """Ask which participants who started on another day count on the class date.
+
+    Poll Everywhere stamps each row of a lecture export with the time of its
+    first answer. When one of a lecture's questions is opened in an earlier
+    class, the answers given then start a row dated that earlier day. Most
+    participants get a fresh row on the class date and count normally, and the
+    review only mentions them. A participant with no such row has every answer
+    under the earlier date, including any given on the class date itself. A
+    row cannot be split by day, so the importer shows what each of them
+    answered, marks the questions nobody else answered on that earlier day,
+    and lets the TA decide. Enter counts nobody, as earlier releases did.
+    """
+    by_file: Dict[Path, List[PollFile]] = {}
+    for poll in polls:
+        by_file.setdefault(poll.path, []).append(poll)
+
+    for path, file_polls in by_file.items():
+        held = sorted(file_polls[0].off_date, key=lambda p: p.name.casefold())
+        if not held:
+            continue
+        class_date = file_polls[0].class_date
+        titles = {p.question_order: p.question_name for p in file_polls}
+        counted = {r.poll_key for p in file_polls for r in p.responses}
+        covered = [
+            p for p in held if next(iter(p.responses.values())).poll_key in counted
+        ]
+        undecided = [p for p in held if p not in covered]
+
+        output_fn("\n" + "=" * 72)
+        output_fn(f"{path.name}: {len(held)} participant(s) started on another day")
+        output_fn("=" * 72)
+        if covered:
+            output_fn(
+                f"Already counted on {class_date} through a row started that day: "
+                + ", ".join(p.name for p in covered)
+            )
+        if not undecided:
+            file_polls[0].off_date.clear()
+            continue
+
+        output_fn(f"\nClass date: {class_date}. Poll Everywhere stamps each row with the")
+        output_fn("time of its first answer, so every answer in the rows below carries")
+        output_fn(f"the earlier day, even any given in class on {_month_day(class_date)}.")
+        output_fn("")
+
+        width = max(len(p.name) for p in undecided)
+        for number, person in enumerate(undecided, start=1):
+            answered = " ".join(f"Q{o}" for o in person.orders)
+            output_fn(
+                f"  {number}. {person.name:<{width}}  started {_clock(person.started_at)}"
+                f"  answered {answered}"
+            )
+            peers = [
+                q for q in held
+                if q is not person and q.started_date == person.started_date
+            ]
+            if peers:
+                seen = {o for q in peers for o in q.orders}
+                only = [o for o in person.orders if o not in seen]
+                if only:
+                    output_fn(
+                        f"     {' '.join(f'Q{o}' for o in only)}: nobody else who started "
+                        f"on {_month_day(person.started_date)} answered "
+                        + ("this" if len(only) == 1 else "these")
+                    )
+
+        output_fn("")
+        for order in sorted({o for p in undecided for o in p.orders}):
+            output_fn(f"  Q{order}  {titles.get(order, '')}")
+
+        while True:
+            raw = clean_space(input_fn(
+                f"\nCount which of them as present on {class_date}? "
+                "[numbers such as 2 or 1,3; Enter for none]: "
+            ))
+            if not raw:
+                chosen: List[OffDateParticipant] = []
+                break
+            try:
+                numbers = sorted({int(x) for x in re.split(r"[,\s]+", raw) if x})
+            except ValueError:
+                numbers = []
+            if numbers and all(1 <= x <= len(undecided) for x in numbers):
+                chosen = [undecided[x - 1] for x in numbers]
+                break
+            output_fn(
+                f"Please enter numbers from 1 to {len(undecided)}, separated by commas, "
+                "or press Enter for none."
+            )
+
+        admit_off_date_participants(file_polls, chosen)
+        if chosen:
+            output_fn(f"  -> Counted on {class_date}: {', '.join(p.name for p in chosen)}")
+        else:
+            output_fn(f"  -> Nobody added to {class_date}.")
+        file_polls[0].off_date.clear()      # decided; never asked twice

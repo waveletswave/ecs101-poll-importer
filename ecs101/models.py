@@ -18,6 +18,7 @@ from .normalize import (
 
 __all__ = [
     "ResponseRow",
+    "OffDateParticipant",
     "PollFile",
     "CanvasStudent",
     "ParseWarning",
@@ -73,18 +74,24 @@ PARTICIPANT_MAP_HEADERS = [
 ]
 
 # The one tab the importer reads but never writes. The instructor records
-# excused absences here, one row per student per class date, and the importer
-# renders them into Attendance. Keeping the annotation in its own tab is what
-# makes it survive: every other tab is rebuilt from scratch on each import.
-EXCUSED_HEADERS = ["Date", "Student Key", "Student Name", "Reason"]
+# excused absences here, one row per student per day or per span of days, and
+# the importer renders them into Attendance. Keeping the annotation in its own
+# tab is what makes it survive: every other tab is rebuilt from scratch on each
+# import.
+#
+# End Date is optional and comes last. The first three columns match the
+# detail rows of Attendance Review, so rows can be pasted straight across.
+EXCUSED_HEADERS = ["Date", "Student Key", "Student Name", "Reason", "End Date"]
 
 # Seeded once, when the tab is created. A row whose Date cell starts with # is
-# a comment, so the worked example can sit there being useful without being
-# reported as an unresolvable row on every run.
+# a comment, so the worked examples can sit there being useful without being
+# reported as unresolvable rows on every run.
 EXCUSED_SEED_ROWS = [
-    ["# 2026-09-02", "canvas:1234567", "Jane Doe", "Varsity travel"],
-    ["# Example above. Remove the # to use a row. Copy Date, Student Key and "
-     "Student from the Attendance Review tab."],
+    ["# 2026-09-02", "canvas:1234567", "Jane Doe", "Dean's note", ""],
+    ["# 2026-10-14", "canvas:1234567", "Jane Doe", "Athletics", "2026-10-19"],
+    ["# Examples above. Remove the # to use a row. With an End Date, every class "
+     "from Date through End Date is excused. Copy Date, Student Key and Student "
+     "Name from the Attendance Review tab."],
 ]
 
 
@@ -137,6 +144,30 @@ class ResponseRow:
 
 
 @dataclass
+class OffDateParticipant:
+    """A participant whose row in a lecture export started on another day.
+
+    Poll Everywhere gives each participant one row per export and stamps it
+    with the time of their first answer. Someone who answered a question opened
+    during an earlier class carries that earlier time on every answer in the
+    row, including answers given on the class date, so the row cannot date
+    itself. It is held back until the TA decides whether it counts.
+    """
+    name: str
+    email: str
+    started_at: str                              # ISO, course timezone
+    responses: Dict[int, ResponseRow]            # question order -> answer
+
+    @property
+    def started_date(self) -> str:
+        return self.started_at[:10]
+
+    @property
+    def orders(self) -> List[int]:
+        return sorted(self.responses)
+
+
+@dataclass
 class PollFile:
     path: Path
     question_name: str
@@ -149,6 +180,9 @@ class PollFile:
     source_format: str = "single-question"
     timezone_label: str = ""
     warnings: List[ParseWarning] = field(default_factory=list)
+    # Participants of this export who started on another day. Every question
+    # parsed from the same file shares one list.
+    off_date: List[OffDateParticipant] = field(default_factory=list)
 
     @property
     def question_id(self) -> str:

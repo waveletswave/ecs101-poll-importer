@@ -109,11 +109,14 @@ def _stage_views(
     class_dates = sorted({
         clean_space(q.get("Date")) for q in questions if clean_space(q.get("Date"))
     })
-    excused, problems = parse_excused_rows(
+    excused, problems, waiting = parse_excused_rows(
         io.records(_title("excused")), roster_rows, class_dates
     )
-    if excused:
-        output_fn(f"\nExcused absences read from the Excused tab: {len(excused)}")
+    if excused or waiting:
+        later = (
+            f" ({waiting} more row(s) are for classes not imported yet)" if waiting else ""
+        )
+        output_fn(f"\nExcused absences read from the Excused tab: {len(excused)}{later}")
     if problems:
         output_fn(f"{len(problems)} Excused row(s) could not be used:")
         for problem in problems[:15]:
@@ -235,7 +238,7 @@ def sync_canvas_roster(
     io.stage(_title("participant_map"), dicts_to_matrix(updated_map_rows, PARTICIPANT_MAP_HEADERS))
     io.stage(_title("responses"), dicts_to_matrix(remapped, RESPONSE_HEADERS))
     io.stage(_title("import_log"), dicts_to_matrix(normalized_logs, IMPORT_LOG_HEADERS))
-    _stage_views(io, existing_questions, remapped, updated_roster)
+    _stage_views(io, existing_questions, remapped, updated_roster, output_fn)
     _commit(io, output_fn)
     journal.clear()
 
@@ -437,7 +440,7 @@ def import_polls(
     io.stage(_title("responses"), dicts_to_matrix(all_responses, RESPONSE_HEADERS))
     io.stage(_title("import_log"), dicts_to_matrix(all_logs, IMPORT_LOG_HEADERS))
     io.stage(_title("participant_map"), dicts_to_matrix(updated_map_rows, PARTICIPANT_MAP_HEADERS))
-    _stage_views(io, all_questions, all_responses, roster_rows)
+    _stage_views(io, all_questions, all_responses, roster_rows, output_fn)
     _commit(io, output_fn)
     journal.clear()
 
@@ -473,7 +476,7 @@ def refresh_views(config: Dict[str, str], output_fn=print) -> None:
     questions = io.records(_title("questions"))
     responses = [normalize_response_schema(r) for r in io.records(_title("responses"))]
 
-    _stage_views(io, questions, responses, roster_rows)
+    _stage_views(io, questions, responses, roster_rows, output_fn)
     _commit(io, output_fn)
 
     output_fn("\nDerived views refreshed.")
@@ -512,7 +515,7 @@ def remap_identities(config: Dict[str, str], output_fn=print) -> None:
 
     io.stage(_title("responses"), dicts_to_matrix(remapped, RESPONSE_HEADERS))
     io.stage(_title("participant_map"), dicts_to_matrix(updated_map_rows, PARTICIPANT_MAP_HEADERS))
-    _stage_views(io, questions, remapped, roster_rows)
+    _stage_views(io, questions, remapped, roster_rows, output_fn)
     _commit(io, output_fn)
 
     output_fn("\nIdentity remap complete.")

@@ -138,7 +138,7 @@ def test_missing_started_at_column_is_fatal(tmp_path: Path):
         parse_poll_everywhere_export(path, "America/New_York")
 
 
-def test_rows_from_another_date_are_dropped_with_a_warning(tmp_path: Path):
+def test_rows_from_another_date_are_held_back_with_a_warning(tmp_path: Path):
     path = tmp_path / "twodates.csv"
     path.write_text(
         "Response #,Started At (CDT),Participant First Name,Participant Last Name,"
@@ -152,6 +152,39 @@ def test_rows_from_another_date_are_dropped_with_a_warning(tmp_path: Path):
     assert polls[0].class_date == "2026-08-26"
     assert len(polls[0].responses) == 2
     assert any("more than one date" in w.message for w in warnings)
+    # Held for the TA to decide on, not thrown away.
+    [held] = polls[0].off_date
+    assert held.name == "Ghost Tester" and held.started_date == "2026-08-19"
+
+
+def test_questions_that_share_a_title_stay_separate(tmp_path: Path):
+    """Three photos, one caption. Each is its own question with its own answers."""
+    path = tmp_path / "rocks.csv"
+    path.write_text(
+        "Response #,Started At (CDT),Participant First Name,Participant Last Name,"
+        "Email,Screen Name,Public ID,Where is this photo taken?,"
+        "What type of rock is this?,What type of rock is this?,What type of rock is this?\n"
+        "1,9/21/26 12:30,Rowan,Fletcher,rowan.fletcher@example.edu,Rowan F,1,Victoria,Chalk,Sandstone,Conglomerate\n"
+        "2,9/21/26 12:31,Noor,Haddad,noor.haddad@example.edu,Noor H.,2,Victoria,Chalk,,Breccia\n"
+        "3,9/21/26 12:32,Petra,Solano,petra.solano@example.edu,Petra S.,3,Victoria,Chert,Sandstone,\n",
+        encoding="utf-8",
+    )
+    polls, warnings = parse_poll_everywhere_export(path, "America/New_York")
+
+    assert [p.question_name for p in polls] == [
+        "Where is this photo taken?",
+        "What type of rock is this?",
+        "What type of rock is this? (2)",
+        "What type of rock is this? (3)",
+    ]
+    assert len({p.question_id for p in polls}) == 4
+    answers = [sorted(r.response for r in p.responses) for p in polls[1:]]
+    assert answers == [
+        ["Chalk", "Chalk", "Chert"],
+        ["Sandstone", "Sandstone"],
+        ["Breccia", "Conglomerate"],
+    ]
+    assert any("3 questions share the title" in w.message for w in warnings)
 
 
 # ---------------------------------------------------------------------------

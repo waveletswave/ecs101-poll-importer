@@ -26,7 +26,7 @@ from .pipeline import (
     run_dry_run,
     sync_canvas_roster,
 )
-from .scoring import configure_daily_scoring
+from .scoring import configure_daily_scoring, review_off_date_participants
 from .sheets import class_window, load_config
 
 __all__ = ["main"]
@@ -344,6 +344,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.dry_run:
         if interactive:
             try:
+                review_off_date_participants(polls)
                 configure_daily_scoring(polls, _flagged_questions(polls))
             except (KeyboardInterrupt, EOFError):
                 print("\nCancelled. No data were written.")
@@ -376,6 +377,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # A real import reads the Import Log before asking anything, then asks the
     # scoring questions only for the exports it is actually going to import.
     def configure(chosen: Sequence[PollFile]) -> None:
+        review_off_date_participants(chosen)
         configure_daily_scoring(chosen, _flagged_questions(chosen))
 
     try:

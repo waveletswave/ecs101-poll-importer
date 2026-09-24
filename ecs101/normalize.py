@@ -13,7 +13,7 @@ import hashlib
 import html
 import re
 import unicodedata
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -33,6 +33,7 @@ __all__ = [
     "short_hash",
     "now_iso",
     "parse_timestamp",
+    "parse_calendar_date",
     "timestamp_sort_key",
     "tz_from_header_label",
     "offset_from_tz_label",
@@ -320,3 +321,41 @@ def parse_clock(value: object, field: str) -> time:
         except ValueError:
             continue
     raise ValueError(f"{field}: expected HH:MM, got {text!r}")
+
+
+# ---------------------------------------------------------------------------
+# Hand-typed calendar dates
+# ---------------------------------------------------------------------------
+
+_WRITTEN_DATE_FORMATS = ("%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y")
+
+
+def parse_calendar_date(value: object) -> Optional[str]:
+    """Read a hand-typed calendar date and return it as YYYY-MM-DD.
+
+    The Excused tab is typed by people, and Google Sheets may reformat what
+    they type, so 2026-11-2, 2026/11/02, 11/2/2026, 11/2/26 and Nov 2, 2026 must
+    all mean the same day. Slashed dates are read month first, as at a US
+    university. Returns None for anything that is not a real date.
+    """
+    text = clean_space(value)
+    if not text:
+        return None
+    iso = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", text)
+    us = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})", text)
+    if iso:
+        year, month, day = (int(g) for g in iso.groups())
+    elif us:
+        month, day, year = (int(g) for g in us.groups())
+        year += 2000 if year < 100 else 0
+    else:
+        for fmt in _WRITTEN_DATE_FORMATS:
+            try:
+                return datetime.strptime(text, fmt).date().isoformat()
+            except ValueError:
+                continue
+        return None
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None

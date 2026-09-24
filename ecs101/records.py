@@ -16,6 +16,7 @@ from .normalize import (
     normalize_person_name,
     normalize_answer_text,
     normalize_email,
+    parse_calendar_date,
     poll_identity_key,
     short_hash,
     timestamp_sort_key,
@@ -332,20 +333,33 @@ def remap_existing_responses(
 # Excused absences
 # ---------------------------------------------------------------------------
 
+def _nearest_class_dates(known: Sequence[str], day: str) -> str:
+    before = [d for d in known if d < day]
+    after = [d for d in known if d > day]
+    near = before[-1:] + after[:1]
+    return f" (nearest class dates: {', '.join(near)})" if near else ""
+
+
 def parse_excused_rows(
     rows: Sequence[Dict[str, str]],
     roster_rows: Sequence[Dict[str, str]],
     class_dates: Sequence[str],
-) -> Tuple[Dict[Tuple[str, str], str], List[str]]:
+) -> Tuple[Dict[Tuple[str, str], str], List[str], int]:
     """Resolve instructor-entered excused absences to (student key, date).
+
+    A row excuses one day in Date, or, when End Date is filled, every class
+    from Date through End Date, including classes imported later. Athletes'
+    accommodations usually cover a span of days, and one row per span is less
+    typing and harder to get wrong than one row per class.
 
     The instructor types these by hand, so every row is checked and anything
     that cannot be resolved is reported rather than dropped in silence. A row
     matches by Student Key when one is given, otherwise by a normalized name
-    that is unique in the roster.
+    that is unique in the roster. A row whose days all fall after the last
+    imported class is not a problem, only early: it is counted as waiting.
 
-    Returns the resolved entries mapped to their reason, plus one message per
-    unusable row.
+    Returns the resolved entries mapped to their reason, one message per
+    unusable row, and the number of rows still waiting for their classes.
     """
     by_key: Dict[str, Dict[str, str]] = {}
     by_name: Dict[str, object] = {}
@@ -358,29 +372,40 @@ def parse_excused_rows(
         if norm:
             by_name[norm] = None if norm in by_name else row
 
-    known_dates = {clean_space(d) for d in class_dates if clean_space(d)}
+    known = sorted({d for d in (parse_calendar_date(x) for x in class_dates) if d})
+    latest = known[-1] if known else ""
     excused: Dict[Tuple[str, str], str] = {}
     problems: List[str] = []
+    waiting = 0
 
     for line_no, row in enumerate(rows, start=2):
-        date = clean_space(row.get("Date"))
+        first_text = clean_space(row.get("Date"))
+        end_text = clean_space(row.get("End Date"))
         raw_key = clean_space(row.get("Student Key"))
         raw_name = clean_space(row.get("Student Name") or row.get("Student"))
         reason = clean_space(row.get("Reason"))
-        if not date and not raw_key and not raw_name:
+        if not first_text and not end_text and not raw_key and not raw_name:
             continue
-        if date.startswith("#"):
-            continue          # a comment or the seeded example
+        if first_text.startswith("#"):
+            continue          # a comment or a seeded example
 
         where = f"Excused row {line_no}"
-        if not date:
-            problems.append(f"{where}: no date")
+        if not first_text:
+            problems.append(f"{where}: " + ("End Date without a Date" if end_text else "no date"))
             continue
-        if known_dates and date not in known_dates:
-            problems.append(
-                f"{where}: {date!r} is not a class date with imported questions"
-            )
+        first = parse_calendar_date(first_text)
+        if first is None:
+            problems.append(f"{where}: cannot read {first_text!r} as a date")
             continue
+        last = first
+        if end_text:
+            last = parse_calendar_date(end_text)
+            if last is None:
+                problems.append(f"{where}: cannot read End Date {end_text!r} as a date")
+                continue
+            if last < first:
+                problems.append(f"{where}: End Date {last} is before Date {first}")
+                continue
 
         student = None
         if raw_key:
@@ -402,7 +427,19 @@ def parse_excused_rows(
                 continue
             student = hit
         else:
-            problems.append(f"{where}: neither Student Key nor Student was given")
+            problems.append(f"{where}: neither Student Key nor Student Name was given")
+            continue
+
+        covered = [d for d in known if first <= d <= last]
+        if not covered:
+            if last > latest:
+                waiting += 1
+            elif first == last:
+                problems.append(
+                    f"{where}: {first} is not a class date{_nearest_class_dates(known, first)}"
+                )
+            else:
+                problems.append(f"{where}: no class date between {first} and {last}")
             continue
 
         skey = clean_space(student.get("Student Key"))
@@ -410,8 +447,9 @@ def parse_excused_rows(
         if raw_key and raw_name and normalize_person_name(raw_name) != normalize_person_name(name):
             problems.append(
                 f"{where}: Student Key {raw_key!r} is {name!r}, but the Student "
-                f"column says {raw_name!r}. Using the key."
+                f"Name column says {raw_name!r}. Using the key."
             )
-        excused[(skey, date)] = reason
+        for day in covered:
+            excused[(skey, day)] = reason
 
-    return excused, problems
+    return excused, problems, waiting

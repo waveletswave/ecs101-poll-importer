@@ -16,7 +16,7 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .models import CanvasStudent, ParseWarning, PollFile, ResponseRow
+from .models import CanvasStudent, OffDateParticipant, ParseWarning, PollFile, ResponseRow
 from .normalize import (
     DEFAULT_COURSE_TZ,
     canvas_display_name,
@@ -226,6 +226,23 @@ def looks_like_poll_export(path: Path) -> bool:
     return False
 
 
+def _question_positions(headers: Sequence[str]) -> List[int]:
+    """Positions of the question columns, in exported order."""
+    clean_headers = [clean_space(h) for h in headers]
+    lowered = [h.casefold() for h in clean_headers]
+    first = lowered.index("public id") + 1 if "public id" in lowered else 0
+
+    picked = [
+        i for i in range(first, len(clean_headers))
+        if not _is_metadata_column(clean_headers[i])
+    ]
+    if picked:
+        return picked
+
+    # Fall back to scanning the whole header when the slice yielded nothing.
+    return [i for i, h in enumerate(clean_headers) if not _is_metadata_column(h)]
+
+
 def lecture_question_columns(headers: Sequence[str]) -> List[str]:
     """Return question columns in the exact order Poll Everywhere exported them.
 
@@ -237,18 +254,22 @@ def lecture_question_columns(headers: Sequence[str]) -> List[str]:
     can be scored.
     """
     clean_headers = [clean_space(h) for h in headers]
-    candidates = clean_headers
+    return [clean_headers[i] for i in _question_positions(headers)]
 
-    lowered = [h.casefold() for h in clean_headers]
-    if "public id" in lowered:
-        candidates = clean_headers[lowered.index("public id") + 1:]
 
-    questions = [h for h in candidates if not _is_metadata_column(h)]
-    if questions:
-        return questions
+def _distinct_titles(titles: Sequence[str]) -> List[str]:
+    """Number repeated question titles so that each question keeps its own ID.
 
-    # Fall back to scanning the whole header when the slice yielded nothing.
-    return [h for h in clean_headers if not _is_metadata_column(h)]
+    A lecture can ask several different questions under one title, such as
+    three photos each captioned "What type of rock is this?". The first keeps
+    the title; the repeats become "... (2)", "... (3)".
+    """
+    seen: Dict[str, int] = {}
+    distinct: List[str] = []
+    for title in titles:
+        seen[title] = seen.get(title, 0) + 1
+        distinct.append(title if seen[title] == 1 else f"{title} ({seen[title]})")
+    return distinct
 
 
 def suspicious_question_columns(
@@ -292,22 +313,46 @@ def _parse_lecture_export(
     path = Path(path)
     warnings: List[ParseWarning] = []
 
+    # Read by position, not by header name. Two questions can share a title,
+    # and a dict keyed by title keeps only the last of them: every earlier
+    # question with that title silently took the last one's answers.
     with path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        headers = [clean_space(h) for h in (reader.fieldnames or [])]
-        raw_rows = list(reader)
+        table = list(csv.reader(f))
+    if not table:
+        raise ValueError(f"{path.name}: the file is empty.")
+    raw_headers = table[0]
+    headers = [clean_space(h) for h in raw_headers]
 
-    question_columns = lecture_question_columns(headers)
-    if not question_columns:
+    positions = _question_positions(headers)
+    if not positions:
         raise ValueError(f"{path.name}: no question columns were detected.")
+    titles = [headers[i] for i in positions]
+    question_names = _distinct_titles(titles)
+    for title in sorted({t for t in titles if titles.count(t) > 1}):
+        warnings.append(ParseWarning(
+            path.name, None,
+            f"{titles.count(title)} questions share the title {title!r}; they are "
+            f"kept apart as {title!r}, {title + ' (2)'!r} and so on",
+        ))
 
-    started_header = next(
-        (h for h in (reader.fieldnames or [])
-         if clean_space(h).casefold().startswith("started at")),
+    def column(name: str) -> Optional[int]:
+        wanted = name.casefold()
+        return next((i for i, h in enumerate(headers) if h.casefold() == wanted), None)
+
+    started_index = next(
+        (i for i, h in enumerate(headers) if h.casefold().startswith("started at")),
         None,
     )
-    if not started_header:
+    if started_index is None:
         raise ValueError(f"{path.name}: missing Started At column.")
+    started_header = raw_headers[started_index]
+    first_index = column("Participant First Name")
+    last_index = column("Participant Last Name")
+    email_index = column("Email")
+    screen_index = column("Screen Name")
+
+    def cell(row: Sequence[str], index: Optional[int]) -> str:
+        return row[index] if index is not None and index < len(row) else ""
 
     tz_label, tz_offset = tz_from_header_label(started_header)
     if tz_label and tz_offset is None:
@@ -336,14 +381,14 @@ def _parse_lecture_export(
             "config.json if the export uses a different clock.",
         ))
 
-    rows = [r for r in raw_rows if any(clean_space(v) for v in r.values())]
+    rows = [r for r in table[1:] if any(clean_space(v) for v in r)]
     if not rows:
         raise ValueError(f"{path.name}: no participant rows found.")
 
     # Parse every row's timestamp once, collecting failures instead of aborting.
     stamps: Dict[int, datetime] = {}
     for index, row in enumerate(rows):
-        raw = row.get(started_header)
+        raw = cell(row, started_index)
         if not clean_space(raw):
             warnings.append(ParseWarning(path.name, index + 2, "blank Started At"))
             continue
@@ -366,37 +411,56 @@ def _parse_lecture_export(
         warnings.append(ParseWarning(
             path.name, None,
             f"rows span more than one date: {detail}; using {class_date} and "
-            "skipping the rest",
+            "holding the other rows back for review",
         ))
 
-    for column, reason in suspicious_question_columns(rows, question_columns).items():
+    named_rows = [
+        {name: cell(row, i) for name, i in zip(question_names, positions)} for row in rows
+    ]
+    for name, reason in suspicious_question_columns(named_rows, question_names).items():
         warnings.append(ParseWarning(
-            path.name, None, f"column {column!r} may not be a question: {reason}"
+            path.name, None, f"column {name!r} may not be a question: {reason}"
         ))
+
+    per_question: List[List[ResponseRow]] = [[] for _ in positions]
+    off_date: List[OffDateParticipant] = []
+    for index, row in enumerate(rows):
+        dt = stamps.get(index)
+        if dt is None:
+            continue
+        first = clean_space(cell(row, first_index))
+        last = clean_space(cell(row, last_index))
+        answers: Dict[int, ResponseRow] = {}
+        for order, i in enumerate(positions, start=1):
+            answer = normalize_answer_text(cell(row, i))
+            if answer:
+                answers[order] = ResponseRow(
+                    response=answer,
+                    via="",
+                    screen_name=clean_space(cell(row, screen_index)),
+                    registered_participant=clean_space(f"{first} {last}"),
+                    created_at=dt.isoformat(timespec="seconds"),
+                    email=normalize_email(cell(row, email_index)),
+                )
+        if not answers:
+            continue
+        if dt.date().isoformat() == class_date:
+            for order, response in answers.items():
+                per_question[order - 1].append(response)
+        else:
+            sample = next(iter(answers.values()))
+            off_date.append(OffDateParticipant(
+                name=sample.student_name,
+                email=sample.normalized_email,
+                started_at=sample.created_at,
+                responses=answers,
+            ))
 
     file_hash = sha256_file(path)
     polls: List[PollFile] = []
-
-    for question_order, question in enumerate(question_columns, start=1):
-        responses: List[ResponseRow] = []
-        for index, row in enumerate(rows):
-            dt = stamps.get(index)
-            if dt is None or dt.date().isoformat() != class_date:
-                continue
-            answer = normalize_answer_text(row.get(question))
-            if not answer:
-                continue
-            first = clean_space(row.get("Participant First Name"))
-            last = clean_space(row.get("Participant Last Name"))
-            responses.append(ResponseRow(
-                response=answer,
-                via="",
-                screen_name=clean_space(row.get("Screen Name")),
-                registered_participant=clean_space(f"{first} {last}"),
-                created_at=dt.isoformat(timespec="seconds"),
-                email=normalize_email(row.get("Email")),
-            ))
-
+    for question_order, (question, responses) in enumerate(
+        zip(question_names, per_question), start=1
+    ):
         poll = PollFile(
             path=path,
             question_name=question,
@@ -407,6 +471,7 @@ def _parse_lecture_export(
             question_order=question_order,
             source_format="lecture-wide",
             timezone_label=tz_label or "",
+            off_date=off_date,
         )
         poll.summary = poll.answer_counts()
         polls.append(poll)
