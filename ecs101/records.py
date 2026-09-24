@@ -297,6 +297,13 @@ def remap_existing_responses(
     This is what backfills a student's earlier attendance once their identity
     is confirmed. v2.3.1 built the final mapping and then never applied it to
     history, so a student confirmed in week 2 stayed absent for week 1.
+
+    Only a decision changes a stored match: a mapping that names a student, or
+    one that marks the participant non-student. An unresolved entry, or no
+    entry at all, means nothing has been decided, so a match already on the row
+    stands. Earlier v3 releases let an unresolved entry blank the match, and a
+    student who joined late lost every earlier class the first time an import
+    ran without them in it.
     """
     remapped: List[Dict[str, str]] = []
     for original in response_rows:
@@ -305,9 +312,17 @@ def remap_existing_responses(
         match_type = clean_space(map_row.get("Match Type")) or "unresolved"
         student_key = clean_space(map_row.get("Student Key"))
 
-        row["Student Key"] = student_key
-        row["Student Name"] = clean_space(map_row.get("Student Name")) if student_key else ""
-        row["Match Status"] = match_type
+        if student_key:
+            row["Student Key"] = student_key
+            row["Student Name"] = clean_space(map_row.get("Student Name"))
+            row["Match Status"] = match_type
+        elif match_type == "non-student":
+            row["Student Key"] = ""
+            row["Student Name"] = ""
+            row["Match Status"] = match_type
+        elif not clean_space(row.get("Student Key")):
+            row["Student Name"] = ""
+            row["Match Status"] = match_type
         remapped.append(row)
 
     return collapse_canonical_responses(remapped)

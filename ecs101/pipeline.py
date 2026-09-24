@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .identity import MatchJournal, resolve_participants
 from .models import (
@@ -280,15 +280,20 @@ def import_polls(
     replace: bool = False,
     input_fn=input,
     output_fn=print,
+    configure: Optional[Callable[[Sequence[PollFile]], None]] = None,
 ) -> None:
+    """Import Poll exports into the canonical tabs and rebuild the views.
+
+    ``configure`` asks the TA the scoring questions. It is called after the
+    Import Log has been read, and only with the exports that will actually be
+    imported, so an already-imported lecture is skipped without a prompt and an
+    expired Google token surfaces before anything has been asked. Earlier
+    releases asked about every export found and connected afterwards.
+    """
     sh, io = _open(config)
     roster_rows = io.records(_title("roster"))
     _require_canvas_roster(roster_rows)
     _report_blank_active(roster_rows, output_fn)
-
-    backup = io.backup(Path(config.get("backup_dir", "backups")), _canonical_titles())
-    if backup:
-        output_fn(f"\nBacked up canonical tabs to: {backup}")
 
     existing_questions = io.records(_title("questions"))
     existing_responses = [
@@ -351,15 +356,23 @@ def import_polls(
         for qid in sorted(replace_qids):
             output_fn(f"  - {qid}")
 
+    if not candidates:
+        output_fn("\nNothing new to import. The spreadsheet was not changed.")
+        return
+
+    # A class date has one scored question. Where one is already stored, the
+    # new questions for that date are attendance-only and nothing is asked.
     existing_scored_by_date = {
         clean_space(q.get("Date")): clean_space(q.get("Question ID"))
         for q in existing_questions
         if str(q.get("Scored", "")).strip().upper() == "TRUE" and clean_space(q.get("Date"))
     }
-    forced = [
-        p for p in candidates
-        if existing_scored_by_date.get(p.class_date) and p.correct_answers is not None
-    ]
+    forced = [p for p in candidates if existing_scored_by_date.get(p.class_date)]
+    if configure is not None:
+        forced_ids = {id(p) for p in forced}
+        to_configure = [p for p in candidates if id(p) not in forced_ids]
+        if to_configure:
+            configure(to_configure)
     for poll in forced:
         poll.correct_answers = None
     if forced:
@@ -367,6 +380,10 @@ def import_polls(
         output_fn("These newly imported Polls will be attendance-only:")
         for poll in forced:
             output_fn(f"  - {poll.question_name}")
+
+    backup = io.backup(Path(config.get("backup_dir", "backups")), _canonical_titles())
+    if backup:
+        output_fn(f"\nBacked up canonical tabs to: {backup}")
 
     journal = MatchJournal(Path(config.get("backup_dir", "backups")) / "import-match.journal.jsonl")
 

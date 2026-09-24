@@ -2,7 +2,7 @@
 
 A Python tool for maintaining the ECS101 **attendance, daily trivia score, and leaderboard** in a shared Google Sheet.
 
-**Current version: v3.0.0**
+**Current version: v3.2.0**
 
 ## Course rules
 
@@ -67,6 +67,8 @@ The importer will:
 7. match participants to the Canvas roster, prompting only for identities it cannot resolve; and
 8. update the shared Google Sheet in one batched write.
 
+Pointing the importer at a folder, or at nothing to use the current folder, imports every Poll export beneath it. It reads the sheet's `Import Log` before asking anything: exports already imported are listed and skipped without a question, and a run with nothing new stops without writing. The backup folder and dry-run previews (`*_preview.csv`) are never scanned.
+
 ## Participant identity matching
 
 Matching runs strictest first. Fuzzy name similarity only ranks candidates for a human. It never confirms a match on its own.
@@ -86,7 +88,7 @@ During review:
 ```text
 1-8        choose a Canvas student
 F <text>   search the roster by name or login
-#<id>      match by Canvas ID directly
+#<id>      match by Canvas ID (the ID column of the Canvas export)
 N          mark as non-student / staff / guest (asks for confirmation)
 S          leave unresolved for now
 ```
@@ -100,6 +102,8 @@ Students missing from a later Canvas roster are marked inactive rather than dele
 ### Identities confirmed later are backfilled
 
 When an identity is confirmed in a later week, the stored responses from earlier weeks are re-mapped in the same run. The student's earlier attendance and trivia score come back automatically. Nothing needs to be re-imported.
+
+The reverse never happens by accident. A stored match changes only on a decision: a Participant Map row that names a different student, or one marked non-student. A row left unresolved means nothing has been decided, so it never clears a match already on a student's responses. Before v3.2.0 it could: a student who joined after drop/add, unmatched until Canvas listed them, lost every earlier class the first time an import ran without them in it.
 
 ## Timezone handling
 
@@ -210,7 +214,7 @@ Re-apply the Participant Map to Responses after editing it by hand, then rebuild
 python ecs101_poll_importer.py --remap-identities
 ```
 
-`--refresh-views` rebuilds views only and never touches canonical data. `--remap-identities` is the one that rewrites `Responses`.
+`--refresh-views` rebuilds views only and never touches canonical data. `--remap-identities` is the one that rewrites `Responses`. To move a participant's responses to another student, put that student's key in their Participant Map row; clearing the key leaves the existing match in place.
 
 Replace a corrected question intentionally:
 
@@ -244,11 +248,12 @@ Unknown settings are rejected by name, so a typo says what is wrong instead of s
 ## When Google authorization expires
 
 `invalid_grant: Token has been expired or revoked` means the cached
-authorization is no longer valid. Delete the token file and run the command
-again; a browser opens to reauthorize:
+authorization is no longer valid. Delete the token file and check the
+connection; a browser opens to reauthorize, and no data are changed:
 
 ```bash
 rm authorized_user.json
+python ecs101_poll_importer.py --check-google
 ```
 
 If it recurs weekly, the cause is the OAuth consent screen. A project set to
@@ -307,7 +312,7 @@ python ecs101_poll_importer.py polls/ --dry-run \
 python tools/compare_views.py ~/Downloads/Attendance.csv preview/attendance_preview.csv
 ```
 
-`tests/test_regressions.py` holds one test per defect found in the v2.3.1 review. Each of them fails against v2.3.1 and passes here. Run the suite before every change.
+`tests/test_regressions.py` holds one test per defect found in the v2.3.1 review. Each of them fails against v2.3.1 and passes here. `tests/test_pipeline.py` runs whole sequences of roster syncs and imports against an in-memory spreadsheet, which is where defects that span several runs show up. Run the suite before every change.
 
 ## Upgrading from v2.x
 

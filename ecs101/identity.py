@@ -251,12 +251,20 @@ def participant_map_index(rows: Sequence[Dict[str, str]]) -> Dict[str, Dict[str,
 
 
 def _canonical_map_rows(idx: Dict[str, Dict[str, str]]) -> List[Dict[str, str]]:
-    """Collapse the alias index back to one row per stored Poll Key."""
+    """Collapse the alias index back to one row per stored Poll Key.
+
+    The entry filed under a Poll Key itself is the current one. An alias still
+    points at the row as it was read at the start of the run, so when an
+    identity is matched during the run, letting the alias win writes the old
+    row back over the new match. That is how a student added to the roster late
+    kept an "unresolved" row however often they were matched, and how a TA's
+    confirmation of an identity skipped in an earlier week was discarded.
+    """
     unique: Dict[str, Dict[str, str]] = {}
-    for row in idx.values():
-        key = clean_space(row.get("Poll Key"))
-        if key:
-            unique[key] = row
+    for key, row in idx.items():
+        pkey = clean_space(row.get("Poll Key"))
+        if pkey and (key == pkey or pkey not in unique):
+            unique[pkey] = row
     return sorted(
         ({h: clean_space(r.get(h)) for h in PARTICIPANT_MAP_HEADERS} for r in unique.values()),
         key=lambda r: (r.get("Poll Participant", "").casefold(), r.get("Poll Key", "")),

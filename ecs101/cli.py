@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -31,12 +32,42 @@ from .sheets import class_window, load_config
 __all__ = ["main"]
 
 
-def discover_csvs(input_path: Path, output_fn=print) -> List[Path]:
+def _is_preview_output(path: Path) -> bool:
+    return path.name.casefold().endswith("_preview.csv")
+
+
+def _nested_csvs(root: Path, ignore_dirs: Sequence[Path]) -> List[Path]:
+    """CSV files below root, leaving out hidden folders and the importer's output."""
+    ignored = {Path(d).expanduser().resolve() for d in ignore_dirs}
+    found: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        dirnames[:] = [
+            d for d in dirnames
+            if not d.startswith((".", "__")) and (here / d).resolve() not in ignored
+        ]
+        for name in filenames:
+            path = here / name
+            if name.casefold().endswith(".csv") and not _is_preview_output(path):
+                found.append(path)
+    return sorted(found)
+
+
+def discover_csvs(
+    input_path: Path,
+    output_fn=print,
+    ignore_dirs: Sequence[Path] = (),
+) -> List[Path]:
     """Find the Poll Everywhere exports to import.
 
     Naming one file imports that file. Naming a folder imports the Poll
     exports in it and skips everything else, so a Canvas roster or a preview
     CSV sitting alongside them does not abort the run.
+
+    The importer's own output is never scanned: the folders in ``ignore_dirs``
+    (the backup folder) and dry-run previews, whose files all end in
+    _preview.csv. Listing those as skipped buried the line that mattered under
+    dozens of file names.
     """
     input_path = Path(input_path)
     if input_path.is_file():
@@ -49,11 +80,13 @@ def discover_csvs(input_path: Path, output_fn=print) -> List[Path]:
     # Top level first, so pointing at one lecture's folder stays predictable.
     # The documented layout nests exports under polls/<date>/, so fall back to
     # a recursive search when the top level holds no Poll exports.
-    all_csvs = sorted(p for p in input_path.glob("*.csv") if p.is_file())
+    all_csvs = sorted(
+        p for p in input_path.glob("*.csv") if p.is_file() and not _is_preview_output(p)
+    )
     files = [p for p in all_csvs if looks_like_poll_export(p)]
 
     if not files:
-        nested = sorted(p for p in input_path.rglob("*.csv") if p.is_file())
+        nested = _nested_csvs(input_path, ignore_dirs)
         nested = [p for p in nested if p not in all_csvs]
         found = [p for p in nested if looks_like_poll_export(p)]
         if found:
@@ -252,8 +285,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     course_tz = clean_space(config.get("course_timezone")) or "America/New_York"
     export_tz = clean_space(config.get("poll_export_timezone"))
 
+    own_output = [Path(config.get("backup_dir") or "backups"), Path(args.output_dir)]
     try:
-        csv_paths = discover_csvs(Path(args.input).expanduser().resolve())
+        csv_paths = discover_csvs(
+            Path(args.input).expanduser().resolve(), ignore_dirs=own_output
+        )
         polls: List[PollFile] = []
         warnings: List[ParseWarning] = []
         for path in csv_paths:
@@ -305,14 +341,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     interactive = not (args.dry_run and args.non_interactive)
 
-    if interactive:
-        try:
-            configure_daily_scoring(polls, _flagged_questions(polls))
-        except (KeyboardInterrupt, EOFError):
-            print("\nCancelled. No data were written.")
-            return 130
-
     if args.dry_run:
+        if interactive:
+            try:
+                configure_daily_scoring(polls, _flagged_questions(polls))
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled. No data were written.")
+                return 130
         try:
             result = run_dry_run(
                 polls,
@@ -338,8 +373,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"\nPreview files written to:\n  {result['output_dir']}")
         return 0
 
+    # A real import reads the Import Log before asking anything, then asks the
+    # scoring questions only for the exports it is actually going to import.
+    def configure(chosen: Sequence[PollFile]) -> None:
+        configure_daily_scoring(chosen, _flagged_questions(chosen))
+
     try:
-        import_polls(polls, config, replace=args.replace)
+        import_polls(polls, config, replace=args.replace, configure=configure)
     except (KeyboardInterrupt, EOFError):
         print("\nCancelled before any write. No new poll data were written.")
         return 130

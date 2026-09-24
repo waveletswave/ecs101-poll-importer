@@ -450,6 +450,43 @@ def test_an_expired_token_explains_how_to_recover(monkeypatch):
     assert "invalid_grant" not in message   # the raw error is the cause, not the message
 
 
+def test_an_expired_token_is_explained_when_the_first_request_fails(monkeypatch):
+    """What gspread really does with an expired token.
+
+    gspread.oauth builds the client from the saved token without contacting
+    Google, and the refresh, with its failure, happens inside the first
+    request. The test above makes oauth itself raise, which is why it passed
+    while the TA still saw google-auth's raw invalid_grant text.
+    """
+    import sys
+    import types
+
+    import ecs101.sheets as sheets
+
+    class RefreshError(Exception):
+        pass
+
+    class Client:
+        def open_by_key(self, key):
+            raise RefreshError(
+                "('invalid_grant: Token has been expired or revoked.', "
+                "{'error': 'invalid_grant'})"
+            )
+
+    monkeypatch.setitem(
+        sys.modules, "gspread", types.SimpleNamespace(oauth=lambda **kwargs: Client())
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        sheets.open_spreadsheet({
+            "spreadsheet_id": "sheet-id",
+            "authorized_user_file": "authorized_user.json",
+        })
+
+    assert "Delete authorized_user.json" in str(caught.value)
+    assert isinstance(caught.value.__cause__, RefreshError)
+
+
 def test_other_auth_failures_are_not_swallowed(monkeypatch):
     import sys
     import types

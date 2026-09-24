@@ -327,6 +327,34 @@ def test_a_top_level_export_wins_over_subfolders(tmp_path: Path, lecture_csv: Pa
     assert discover_csvs(day, output_fn=silent) == [top]
 
 
+def test_discover_ignores_backups_and_dry_run_previews(
+    tmp_path: Path, lecture_csv: Path, canvas_csv: Path
+):
+    """The backup folder and preview CSVs are the importer's own output."""
+    from ecs101.cli import discover_csvs
+
+    root = tmp_path / "course"
+    export = root / "polls" / "2026-08-26" / "Lecture2.csv"
+    export.parent.mkdir(parents=True)
+    export.write_text(lecture_csv.read_text(encoding="utf-8"), encoding="utf-8")
+    (root / "rosters").mkdir()
+    (root / "rosters" / "canvas.csv").write_text(canvas_csv.read_text(encoding="utf-8"),
+                                                 encoding="utf-8")
+    snapshot = root / "backups" / "20260916-152332"
+    snapshot.mkdir(parents=True)
+    (snapshot / "responses.csv").write_text("Date,Question ID\n", encoding="utf-8")
+    (root / "preview").mkdir()
+    (root / "preview" / "responses_preview.csv").write_text("Date\n", encoding="utf-8")
+
+    printed = []
+    found = discover_csvs(root, output_fn=printed.append, ignore_dirs=[root / "backups"])
+
+    assert found == [export]
+    assert [line for line in printed if line.startswith("Skipped")] == [
+        "Skipped 1 CSV file(s) that are not Poll Everywhere exports: canvas.csv"
+    ]
+
+
 def test_a_missing_roster_path_fails_before_any_prompt(tmp_path: Path, lecture_csv: Path, capsys):
     """A wrong --roster-csv must not cost the TA a full round of scoring prompts."""
     from ecs101.cli import main

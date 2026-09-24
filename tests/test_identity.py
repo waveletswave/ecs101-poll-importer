@@ -275,3 +275,92 @@ def test_an_interrupted_review_resumes(roster_rows, tmp_path: Path, silent, scri
     )
     assert stats.get("resumed") == 1
     assert lookup_mapping(mapping, "Mystery Person", "mystery@example.com")["Student Key"] == "canvas:100004"
+
+
+# ---------------------------------------------------------------------------
+# A Participant Map row that changes during a run must be saved as changed.
+# Every row is also reachable through a name alias, and the alias used to be
+# written back last, restoring the row as it was read.
+# ---------------------------------------------------------------------------
+
+def _saved_unresolved(name, email):
+    return {
+        "Poll Key": f"email:{email}", "Poll Participant": name, "Poll Email": email,
+        "Student Key": "", "Student Name": "", "Match Type": "unresolved",
+        "Updated At": "2026-09-02T18:25:37-04:00", "Notes": "",
+    }
+
+
+def test_an_automatic_match_replaces_a_saved_unresolved_row(roster_rows, silent):
+    """Skipped before Canvas listed the student, then matched by address."""
+    saved = [_saved_unresolved("Rowan Fletcher", "rowan.fletcher@example.edu")]
+    _, rows, _ = resolve_participants(
+        [_row("Rowan Fletcher", "rowan.fletcher@example.edu")], roster_rows, saved,
+        interactive=False, output_fn=silent,
+    )
+    stored = {r["Poll Key"]: r for r in rows}["email:rowan.fletcher@example.edu"]
+    assert (stored["Student Key"], stored["Match Type"]) == ("canvas:100001", "email-name")
+
+
+def test_a_confirmation_replaces_a_saved_unresolved_row(roster_rows, scripted, silent):
+    """Skipped with S one week, confirmed by the TA the next."""
+    saved = [_saved_unresolved("Noor H.", "nh.personal@example.com")]
+    _, rows, _ = resolve_participants(
+        [_row("Noor H.", "nh.personal@example.com")], roster_rows, saved,
+        interactive=True, input_fn=scripted("#100003"), output_fn=silent,
+    )
+    stored = {r["Poll Key"]: r for r in rows}["email:nh.personal@example.com"]
+    assert (stored["Student Key"], stored["Match Type"]) == ("canvas:100003", "confirmed")
+
+
+# ---------------------------------------------------------------------------
+# Re-applying the map to stored responses changes a match only on a decision.
+# ---------------------------------------------------------------------------
+
+LATE_KEY = "email:marguerite.ellsworth@example.edu"
+
+
+def _stored_response(student_key="canvas:100007", status="email-name"):
+    return {
+        "Date": "2026-09-02", "Question ID": "2026-09-02::Q1",
+        "Student Key": student_key,
+        "Student Name": "Marguerite Ellsworth" if student_key else "",
+        "Poll Key": LATE_KEY, "Poll Participant": "Marguerite Ellsworth",
+        "Poll Email": "marguerite.ellsworth@example.edu", "Screen Name": "Marguerite E",
+        "Response": "Diamond", "Correct": "", "Timestamp": "2026-09-02T13:40:00-04:00",
+        "File Hash": "cccccccccccc", "Match Status": status,
+    }
+
+
+def _map_entry(match_type, student_key="", student_name=""):
+    return {LATE_KEY: {
+        "Poll Key": LATE_KEY, "Poll Participant": "Marguerite Ellsworth",
+        "Poll Email": "marguerite.ellsworth@example.edu", "Student Key": student_key,
+        "Student Name": student_name, "Match Type": match_type,
+    }}
+
+
+@pytest.mark.parametrize("mapping", [_map_entry("unresolved"), {}], ids=["unresolved", "absent"])
+def test_no_decision_never_clears_a_stored_match(mapping):
+    from ecs101.records import remap_existing_responses
+
+    [row] = remap_existing_responses([_stored_response()], mapping)
+    assert (row["Student Key"], row["Match Status"]) == ("canvas:100007", "email-name")
+
+
+def test_a_decision_still_changes_a_stored_match():
+    from ecs101.records import remap_existing_responses
+
+    [row] = remap_existing_responses([_stored_response()], _map_entry("non-student"))
+    assert (row["Student Key"], row["Match Status"]) == ("", "non-student")
+
+    moved = _map_entry("confirmed", "canvas:100005", "Mai Thi Lan Pham")
+    [row] = remap_existing_responses([_stored_response()], moved)
+    assert (row["Student Key"], row["Student Name"]) == ("canvas:100005", "Mai Thi Lan Pham")
+
+
+def test_an_unmatched_response_stays_unresolved():
+    from ecs101.records import remap_existing_responses
+
+    [row] = remap_existing_responses([_stored_response("", "unresolved")], _map_entry("unresolved"))
+    assert (row["Student Key"], row["Student Name"], row["Match Status"]) == ("", "", "unresolved")

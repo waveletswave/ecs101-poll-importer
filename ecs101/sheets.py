@@ -185,7 +185,7 @@ def get_google_client(config: Dict[str, str]):
             "gspread is not installed. Run: python -m pip install -r requirements.txt"
         ) from exc
 
-    token_file = config.get("authorized_user_file", "authorized_user.json")
+    token_file = _token_file(config)
     try:
         return gspread.oauth(
             scopes=["https://www.googleapis.com/auth/spreadsheets"],
@@ -195,17 +195,25 @@ def get_google_client(config: Dict[str, str]):
     except Exception as exc:
         if not _is_expired_token(exc):
             raise
-        raise RuntimeError(
-            "The saved Google authorization has expired or been revoked.\n"
-            f"Delete {token_file} and run the command again; a browser will "
-            "open to reauthorize.\n"
-            "\n"
-            "If this keeps happening every week: an OAuth consent screen set "
-            "to External with a publishing status of Testing issues refresh "
-            "tokens that expire after seven days. Publishing the app, or "
-            "switching it to Internal if the project sits in a Google "
-            "Workspace organization, removes that limit."
-        ) from exc
+        raise _expired_token_error(token_file) from exc
+
+
+def _token_file(config: Dict[str, str]) -> str:
+    return config.get("authorized_user_file", "authorized_user.json")
+
+
+def _expired_token_error(token_file: str) -> RuntimeError:
+    return RuntimeError(
+        "The saved Google authorization has expired or been revoked.\n"
+        f"Delete {token_file} and run the command again; a browser will "
+        "open to reauthorize.\n"
+        "\n"
+        "If this keeps happening every week: an OAuth consent screen set "
+        "to External with a publishing status of Testing issues refresh "
+        "tokens that expire after seven days. Publishing the app, or "
+        "switching it to Internal if the project sits in a Google "
+        "Workspace organization, removes that limit."
+    )
 
 
 def _is_expired_token(exc: BaseException) -> bool:
@@ -217,8 +225,19 @@ def _is_expired_token(exc: BaseException) -> bool:
 
 
 def open_spreadsheet(config: Dict[str, str]):
+    """Open the course spreadsheet.
+
+    gspread builds its client from the saved token without contacting Google
+    and refreshes the token inside the first request. An expired token
+    therefore fails here, not in get_google_client, and is explained here.
+    """
     gc = get_google_client(config)
-    return with_retry(gc.open_by_key, clean_space(config["spreadsheet_id"]))
+    try:
+        return with_retry(gc.open_by_key, clean_space(config["spreadsheet_id"]))
+    except Exception as exc:
+        if not _is_expired_token(exc):
+            raise
+        raise _expired_token_error(_token_file(config)) from exc
 
 
 # ---------------------------------------------------------------------------
